@@ -60,6 +60,7 @@ class Correction(nn.Module):
         plt.plot(t,linear_correction,label="linear")
         plt.plot(t,score_correction,label="score")
         plt.legend()
+        plt.savefig("correction_schedule.png")
         plt.show()
     
 def get_force_correction(force):
