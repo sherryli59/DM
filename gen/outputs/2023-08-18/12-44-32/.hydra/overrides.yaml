@@ -1,0 +1,2 @@
+- ++model.representation.force_prefactor=1
+- ++dataset.name=LJ_5_force_1

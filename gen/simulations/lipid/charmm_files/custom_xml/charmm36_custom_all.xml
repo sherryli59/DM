@@ -1,0 +1,4 @@
+<ForceField>
+  <Include file="charmm36_lipid_list.xml"/>
+  <Include file="waters_ions_spc_e.xml"/>
+</ForceField>

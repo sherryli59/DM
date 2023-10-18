@@ -1,0 +1,54 @@
+run:
+  mode: train
+  nsamples: 100
+  return_prob: true
+  return_traj: true
+  sampling_method: ode
+device: cuda:0
+dataset:
+  name: LJ_50
+  potential: LJ
+  training_data: /home/sherryli/xsli/GenerativeModel/data/lj/liquid_3d/nonperiodic/lj_50_3d_3.0box_T1.00/pos_train.npy
+  testing_data: /home/sherryli/xsli/GenerativeModel/data/lj/liquid_3d/nonperiodic/lj_50_3d_3.0box_T1.00/pos_test.npy
+  dim: 3
+  nparticles: 50
+  shape: (50,3)
+  boxlength: 5.42
+  cutoff: 5.0
+  kT: 1.0
+  periodic: false
+  translation_inv: true
+  sigma: 1.0
+  epsilon: 1.0
+  shift: true
+  atomic_numbers: None
+model:
+  type: diffusion
+  representation:
+    type: vectorfield
+    hidden_dim: 500
+  sde:
+    type:
+    - GeneralSDE
+    - VP_SDE
+    knots:
+    - 0.2
+    schedule: linear
+    friction: 10.0
+train_parameters:
+  max_epochs: 100
+  batch_size: 64
+  output_freq: 100
+  scheduler: exponential
+  lr_scheduler_gamma: 0.99
+optimizer:
+  lr: 0.0003
+  beta1: 0.9
+  eps: 1.0e-08
+  warmup: 0
+  grad_clip: 1.0
+output:
+  training_dir: /home/sherryli/xsli/GenerativeModel/training_output/lj/
+  testing_dir: /home/sherryli/xsli/GenerativeModel/testing_output/lj/
+  model_dir: /home/sherryli/xsli/GenerativeModel/trained_models/lj/
+  best_model_dir: /home/sherryli/xsli/GenerativeModel/trained_models/lj/
