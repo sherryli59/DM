@@ -256,11 +256,11 @@ class GeneralSDE(SDE):
         return self.drift(x,t),self.diffusion(x,t)
 
 class PiecewiseSDE(SDE):
-    def __init__(self, device="cuda",**kwargs):
+    def __init__(self, **kwargs):
         super().__init__()
         self.setup_sde(**kwargs)
-        self.t_init_list = self.knots[:-1].to(device)
-        self.t_final_list = self.knots[1:].to(device)
+        self.register_buffer("t_init_list", self.knots[:-1])
+        self.register_buffer("t_final_list", self.knots[1:])
 
     def setup_sde(self,type=["VP_SDE"],schedule="linear",knots=[],data_handler=None,kT=1,friction=10,translation_inv=False,):
         if isinstance(type, str):
@@ -279,7 +279,7 @@ class PiecewiseSDE(SDE):
                 translation_inv=translation_inv, **dict(diffusion_params))
             self.sde_list.append(sde_i)
 
-    def _sde_idx(self,t,forward=True):         
+    def _sde_idx(self,t,forward=True):   
         t_diff = t.unsqueeze(1)-self.t_init_list.unsqueeze(0)
         t_diff[t_diff<=0] = 1.
         sde_idx = torch.argmin(t_diff,dim=1)
@@ -322,12 +322,12 @@ class PiecewiseSDE(SDE):
             output_list.append({k:v[sde_idx[mask]==i].clone() for k,v in output.items()})
         return output_list, sde_idx
     
-    def _backward(self,x,score_fn,t_init=None, **kwargs): #integrate backward from t to eps
+    def backward(self,x,score_fn,t_init=None, **kwargs): #integrate backward from t to eps
         if t_init is None:
             t_init = torch.full((len(x),),1.).to(x.device)
         for i in torch.linspace(len(self.sde_list)-1,0,len(self.sde_list)).int():
             x = self._apply_constraints(x)
-            t_init = torch.clip(t_init,max=self.t_final_list[i])
+            t_init = torch.clip(t_init,max=self.t_final_list[i].to(t_init.device))
             t_final = self.t_init_list[i]
             with torch.no_grad():
                 output_i = self.sde_list[i].backward(x,score_fn,t_init,t_final,**kwargs)

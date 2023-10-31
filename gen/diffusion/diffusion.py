@@ -73,12 +73,11 @@ class BaseModule(LightningModule):
 class DiffusionModel(BaseModule):
     def __init__(self,score,sde,shape,data_handler=None,likelihood_weighting=False,
                  eps = 1e-4, lr: float = 0.001,
-                weight_decay: float = 0.0005, device="cuda",**kwargs: Any):
+                weight_decay: float = 0.0005, **kwargs: Any):
         super().__init__()    
         self.save_hyperparameters()
         self.eps = eps
         self.data_handler = data_handler
-        self._device = device
         self.shape = shape
         self.likelihood_weighting = likelihood_weighting
         self.sde = sde
@@ -112,9 +111,9 @@ class DiffusionModel(BaseModule):
 
     def sample(self,nsamples,method="ode",return_traj=False, return_prob=False,batchsize=100,init=None,t_init=None):
         if t_init is None:
-            t_init = torch.full((nsamples,),1.).to(self._device)
+            t_init = torch.full((nsamples,),1.).to(self.device)
         if init is None:
-            init = torch.randn([nsamples]+list(self.shape)).to(self._device)
+            init = torch.randn([nsamples]+list(self.shape)).to(self.device)
         if nsamples < batchsize:
             batchsize = nsamples
         for i in range(nsamples//batchsize):

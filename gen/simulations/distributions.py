@@ -1,5 +1,4 @@
 #from lammps import lammps, PyLammps, LMP_STYLE_ATOM, LMP_TYPE_ARRAY
-import MDAnalysis as MDA
 import torch
 import numpy as np
 import random
