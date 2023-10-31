@@ -91,7 +91,7 @@ class SDE(nn.Module):
         if t_final is None:
             t_final = torch.full((len(x),),self.t_range[0]+self.eps).to(x.device)
         else:
-            t_final = torch.clip(t_final, min=self.t_range[0]+self.eps)
+            t_final = torch.clip(t_final, min=(self.t_range[0]+self.eps).to(t_final.device))
         if len(t_init.shape)==0:
             t_init = t_init.unsqueeze(0).expand(len(x),).to(x.device)
         if len(t_final.shape)==0:
@@ -280,7 +280,7 @@ class PiecewiseSDE(SDE):
             self.sde_list.append(sde_i)
 
     def _sde_idx(self,t,forward=True):   
-        t_diff = t.unsqueeze(1)-self.t_init_list.unsqueeze(0)
+        t_diff = t.unsqueeze(1)-self.t_init_list.unsqueeze(0).to(t.device)
         t_diff[t_diff<=0] = 1.
         sde_idx = torch.argmin(t_diff,dim=1)
         if forward:
@@ -322,7 +322,7 @@ class PiecewiseSDE(SDE):
             output_list.append({k:v[sde_idx[mask]==i].clone() for k,v in output.items()})
         return output_list, sde_idx
     
-    def backward(self,x,score_fn,t_init=None, **kwargs): #integrate backward from t to eps
+    def _backward(self,x,score_fn,t_init=None, **kwargs): #integrate backward from t to eps
         if t_init is None:
             t_init = torch.full((len(x),),1.).to(x.device)
         for i in torch.linspace(len(self.sde_list)-1,0,len(self.sde_list)).int():

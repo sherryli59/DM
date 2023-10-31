@@ -114,6 +114,8 @@ class DiffusionModel(BaseModule):
             t_init = torch.full((nsamples,),1.).to(self.device)
         if init is None:
             init = torch.randn([nsamples]+list(self.shape)).to(self.device)
+        if init is not None:
+            nsamples = init.shape[0]
         if nsamples < batchsize:
             batchsize = nsamples
         for i in range(nsamples//batchsize):
@@ -127,6 +129,7 @@ class DiffusionModel(BaseModule):
             else:
                 for key, val in batch_out.items():
                     out[key] = torch.cat((out[key],val),dim=0)
+            out.update({"init":init})
         return out
     
     
