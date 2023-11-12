@@ -4,6 +4,7 @@ from typing import Any
 
 from gen.diffusion import loss_fn
 from gen.diffusion.sde import *
+from gen.diffusion.likelihood import  get_likelihood_fn
 
 
 class BaseModule(LightningModule):
@@ -63,7 +64,6 @@ class BaseModule(LightningModule):
         return {'loss': loss}
     
     def test_step(self, batch: Any, batch_idx: int):
-        
         return {'loss': self.step(batch)}
     
     
@@ -81,7 +81,7 @@ class DiffusionModel(BaseModule):
         self.shape = shape
         self.likelihood_weighting = likelihood_weighting
         self.sde = sde
-        self.score_fn = score
+        self.score_fn = score.to(self.device)
         if hasattr(self.sde, "sde_list"):
             self.loss_fn = lambda x,t: loss_fn.piecewise_sde_loss(self.sde,self.score_fn,x,t)
         else:
@@ -107,9 +107,14 @@ class DiffusionModel(BaseModule):
             print(t)
         loss = self.loss_fn(batch,t)
         return loss
-
+    
+    def test_step(self, batch: Any, batch_idx: int):
+        prob = get_likelihood_fn(noise_to_data=False)
+        logp, x, _ = prob(self.sde,self.score_fn, batch)
+        return {"logp":logp}
 
     def sample(self,nsamples,method="ode",return_traj=False, return_prob=False,batchsize=100,init=None,t_init=None):
+        self.score_fn = self.score_fn.to(self.device)
         if t_init is None:
             t_init = torch.full((nsamples,),1.).to(self.device)
         if init is None:
@@ -129,7 +134,7 @@ class DiffusionModel(BaseModule):
             else:
                 for key, val in batch_out.items():
                     out[key] = torch.cat((out[key],val),dim=0)
-            out.update({"init":init})
+        out.update({"init":init})
         return out
     
     

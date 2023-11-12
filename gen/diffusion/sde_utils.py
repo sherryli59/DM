@@ -36,7 +36,7 @@ class SDESolver():
         self.solver = sdeint_adjoint if adjoint else sdeint
         self.dt = dt
 
-    def solve(self,x0,t_init:float,t_final,t_range=(0,1),save_sample_traj=False,**kwargs):
+    def solve(self,x0,t_init:float,t_final,t_range=(0,1),save_sample_traj=True,**kwargs):
         shape = torch.tensor(x0.shape[1:])
         if isinstance(t_final,float):
             t_final = torch.tensor([t_final]).to(x0.device)
@@ -56,9 +56,10 @@ class SDESolver():
         order = order[order!=0]
         x0 = x0.reshape(len(x0),-1)
         if save_sample_traj:
-            t = torch.linspace(t_init,0.2,100).to(x0.device)
+            t = torch.linspace(t_init,float(t_final[0]),100).to(x0.device)
             traj_sample = sdeint(fn, x0, t, dt=self.dt, method=self.method)
-            utils.write_coord("forward_traj.xyz",traj.reshape([-1,len(x0)]+list(shape))[:,0],nparticles=20)
+            utils.write_coord("forward_traj.xyz",traj_sample.reshape([-1,len(x0)]+list(shape))[:,0],nparticles=20)
+            np.save("forward_traj.npy",traj_sample.detach().cpu().numpy())
         traj = sdeint(fn, x0, unique_t, dt=self.dt, method=self.method)
         traj = traj[inverse_indices]
         traj = traj[order]

@@ -188,10 +188,10 @@ class VectorField(nn.Module):
             self._n_out = self._mus_time.shape[0]
 
         if optimize_d_gammas:
-            self._neg_log_gammas = torch.nn.Parameter(self._neg_log_gammas)
+            self._neg_log_gammas = torch.nn.Parameter(self._neg_log_gammas).to(device)
 
         if optimize_t_gammas:
-            self._neg_log_gammas_time = torch.nn.Parameter(self._neg_log_gammas_time)
+            self._neg_log_gammas_time = torch.nn.Parameter(self._neg_log_gammas_time).to(device)
 
         self._weights = torch.nn.Parameter(
             torch.Tensor(self._n_kernels, self._n_out).normal_() * np.sqrt(1. / self._n_kernels)
@@ -213,7 +213,7 @@ class VectorField(nn.Module):
         return mus,gammas,mus_time,gammas_time
     
     def _force_mag(self, t, d, derivative=False):
-        importance = self._importance
+        importance = self._importance.to(d.device)
         self._mus = self._mus.to(d.device)
         self._neg_log_gammas = self._neg_log_gammas.to(d.device)
         self._mus_time = self._mus_time.to(t.device)

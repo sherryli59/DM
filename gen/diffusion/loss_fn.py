@@ -11,7 +11,7 @@ def sliced_score_matching(score_fn, samples, t, n_eps=1):
         norm = torch.sum((score * score).view(score.shape[0],-1), dim=-1) 
         scorev = torch.sum(score * rand_v)
         grad = torch.autograd.grad(scorev, dup_samples, create_graph=True)[0]    
-    
+        
     trace = torch.sum((rand_v * grad).view(grad.shape[0],-1), dim=-1)
     norm = norm.view(n_eps, -1).mean(dim=0)
     trace = trace.view(n_eps, -1).mean(dim=0)

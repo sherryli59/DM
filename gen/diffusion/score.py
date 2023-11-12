@@ -113,8 +113,8 @@ class Score(torch.nn.Module):
                     score_i = nn(x[mask],t[mask])
                     score_i = _batch_mult(1/self.marginal_prob_std(t[mask]),score_i)
                     score[mask] = score_i
-                if self.correction is not None:
-                    score = self.correction(x,t,score)   
+                #if self.correction is not None:
+                    #score = self.correction(x,t,score)   
                 if torch.max(x)>5:
                     print(torch.max(x))
                     print("warning: x is large")

@@ -10,13 +10,14 @@ from gen.diffusion.likelihood import  get_likelihood_fn
 
 
 class SDE(nn.Module):
-    def __init__(self,max_nsteps=1000,schedule="linear",beta_max=20,eps=1e-4,translation_inv=False,t_range=(1e-4,1),**kwargs):
+    def __init__(self,max_nsteps=1000,schedule="linear",beta_max=20,eps=1e-4,periodic_boxlen=None,translation_inv=False,t_range=(1e-4,1),**kwargs):
         super().__init__()
         self.t_range = torch.clip(torch.tensor(t_range),min=eps)
         self.schedule = NoiseSchedule(type=schedule,max=beta_max,t_range=self.t_range)
         self.eps = eps
         self.max_nsteps = max_nsteps
         self.translation_inv = translation_inv
+        self.periodic_boxlen = periodic_boxlen
         self.reverse_solver = SDESolver(self.reverse_drift,self.diffusion)
 
     def _batch_mult(self,coeff,data):
@@ -25,6 +26,8 @@ class SDE(nn.Module):
     def _apply_constraints(self,x):
         if self.translation_inv:
             x = x - torch.mean(x,axis=1).unsqueeze(1)          
+        if self.periodic_boxlen is not None:
+            x = torch.remainder(x,self.periodic_boxlen)
         return x
     
     def generate_t(self,nsamples,likelihood_weighting=False):
@@ -162,14 +165,31 @@ class LinearSDE(SDE):
             return self._t_generator().rvs(size=nsamples)
         else:
             return torch.rand(nsamples)*(self.t_range[1]-self.t_range[0])+self.t_range[0]
-
+        
+    def sde(self,x,t):
+        if len(t.shape)==0:
+            t = t.unsqueeze(0).expand(len(x),).to(x.device)
+        x = self._apply_constraints(x)
+        return self.drift(x,t),self.diffusion(x,t)
+     
     def std_fn(self,t):
         std = torch.ones_like(t)
         mask = (t >= self.t_range[0]) * (t <= self.t_range[1])
         std[mask] = self.marginal_prob(t[mask],t_init=self.t_range[0])[1]
         return std
 
+class PureDiffusion(SDE):
+    def __init__(self,D,max_nsteps=1000,eps=1e-4,**kwargs):
+        super().__init__(max_nsteps,eps=eps,**kwargs)
+        self.D = torch.tensor(D)
+        self.sde_solver = SDESolver(self.drift,self.diffusion)
 
+    def drift(self,x,t):
+        return torch.zeros_like(x)
+    
+    def diffusion(self,x,t):
+        return torch.sqrt(2*self.D)*torch.ones_like(x)
+    
 class VP_SDE(LinearSDE):
     def __init__(self,max_nsteps=1000,beta_max=20,eps=1e-3,schedule="linear",**kwargs):
         super().__init__(max_nsteps,schedule,eps=eps,beta_max=beta_max,**kwargs)
@@ -262,7 +282,7 @@ class PiecewiseSDE(SDE):
         self.register_buffer("t_init_list", self.knots[:-1])
         self.register_buffer("t_final_list", self.knots[1:])
 
-    def setup_sde(self,type=["VP_SDE"],schedule="linear",knots=[],data_handler=None,kT=1,friction=10,translation_inv=False,):
+    def setup_sde(self,type=["VP_SDE"],schedule="linear",knots=[],data_handler=None,D=1, kT=1,friction=10,periodic_boxlen=None,translation_inv=False,):
         if isinstance(type, str):
             type = [type]
         self.sde_list = nn.ModuleList()
@@ -274,9 +294,10 @@ class PiecewiseSDE(SDE):
             if sde_type == "GeneralSDE":
                 diffusion_params.update({"f": copy.deepcopy(neg_force_wrapper(data_handler)), 
                                     "kT": kT, "friction": friction})
-        
+            if sde_type == "PureDiffusion":
+                diffusion_params.update({"D": D})
             sde_i = eval(sde_type)(schedule=schedule, 
-                translation_inv=translation_inv, **dict(diffusion_params))
+                translation_inv=translation_inv,periodic_boxlen=periodic_boxlen, **dict(diffusion_params))
             self.sde_list.append(sde_i)
 
     def _sde_idx(self,t,forward=True):   

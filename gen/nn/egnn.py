@@ -246,10 +246,14 @@ class SinusoidsEmbeddingNew(torch.nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb.detach()
 
+def pair_dist(x, y):
+    pair_vec = (x.unsqueeze(-2) - y.unsqueeze(-3))
+    return torch.linalg.norm(pair_vec.float(), axis=-1)
+
 def get_edges(batch, x,edge_cutoff=None):
     adj = batch[:, None] == batch[None, :]
     if edge_cutoff is not None:
-        adj = adj & (torch.cdist(x, x) <= edge_cutoff)
+        adj = adj & (pair_dist(x, x) <= edge_cutoff)
     edges = torch.stack(torch.where(adj), dim=0)
     return edges
 
@@ -283,9 +287,13 @@ def unsorted_segment_sum(data, segment_ids, num_segments, normalization_factor, 
 if __name__=="__main__":
     model = EGNN(1,256, n_layers=1)
     x = torch.randn(2,2,3).to("cuda")
+    x.requires_grad=True
     t = torch.rand(2).to("cuda")
     t2 = torch.rand(2).to("cuda")
     y = model(x,t)
+    eps = torch.randn([1]+list(x.shape)).to(x.device)
+    fn_eps = torch.sum(y.unsqueeze(0) * eps, dim=tuple(range(1, len(x.shape)+1)))
+    print(torch.autograd.grad(y, x,torch.ones_like(y))[0])
     y2 = model(x,t2)
     print(y)
     print(y-y2)

@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 from scipy import integrate
 from torchdiffeq import odeint as odeint
@@ -6,7 +7,7 @@ try:
     from functorch import vmap
 except ModuleNotFoundError:
     pass
-from dm.diffusion import utils
+from gen.diffusion import utils
 
 
 def get_div_fn(fn):
@@ -25,6 +26,20 @@ def get_div_fn(fn):
     x.requires_grad_(False)
     return torch.mean(torch.sum(grad_fn_eps* eps, dim=tuple(range(2, len(x.shape)+1))),dim=0)
 
+  # def div_fn_2(x,t,eps, n_eps=1):
+  #   dup_samples = x.unsqueeze(0).expand(n_eps,
+  #        *x.shape).contiguous().view(-1, *x.shape[1:])
+  #   dup_t = t.tile(n_eps)
+  #   dup_samples = dup_samples.detach().requires_grad_(True)
+  #   rand_v = eps
+  #   with torch.enable_grad():
+  #       score = fn(dup_samples,dup_t)
+  #       scorev = torch.sum(score * rand_v)
+  #       grad = torch.autograd.grad(scorev, dup_samples, create_graph=True)[0]    
+  #   trace = torch.sum((rand_v * grad).view(grad.shape[0],-1), dim=-1)
+  #   trace_2 = div_fn(x,t,eps)
+  #   print("should be 0:", torch.mean(trace-trace_2))
+  #   return trace
   return div_fn
 
 
@@ -45,14 +60,13 @@ def get_likelihood_fn(hutchinson_type='Gaussian', noise_mult=5,
     """The drift function of the reverse-time SDE."""
     # Probability  flow ODE is a special case of Reverse SDE
     rsde = model.reverse_sde(x,t,score_fn,ode=True)
-    #print(t,rsde[0][0,0])
     return rsde[0]
 
   def div_fn(model, score_fn, x, t, noise):
     return get_div_fn(lambda xx, tt: drift_fn(model, score_fn, xx, tt))(x, t, noise)
 
   def likelihood_fn(model,score_fn, x0):
-    """Compute an unbiased estimate to the log-likelihood in bits/dim.
+    """Compute an unbiased estimate to the log-likelihood.
     Args:
       model: A score model.
       x0: A PyTorch tensor.
@@ -85,7 +99,6 @@ def get_likelihood_fn(hutchinson_type='Gaussian', noise_mult=5,
     else:
       span = (eps,1)  
     #solution = integrate.solve_ivp(ode_func, span, init, rtol=rtol, atol=atol, method=method, vectorized = True)
-    print(ode_func(1.0,init))
     solution = integrate.solve_ivp(ode_func, span, init, rtol=1., atol=1., method=method, max_step=1/1000, vectorized = True)
     nfe = solution.nfev
     zp = solution.y[:, -1]
@@ -107,14 +120,6 @@ def get_likelihood_fn(hutchinson_type='Gaussian', noise_mult=5,
 
 
 
-import torch
-import torch.nn as nn
-from torchdiffeq import odeint as odeint
-try:
-    from functorch import vmap
-except ModuleNotFoundError:
-    pass
-import numpy as np
 
 class ODEFunc(nn.Module):
     def __init__(self, dynamics, trace_method="hutch", ode_regularization=0, hutch_noise="gaussian"):
