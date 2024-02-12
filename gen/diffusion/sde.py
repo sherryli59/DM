@@ -3,17 +3,22 @@ import torch
 import torch.nn as nn
 import math
 import copy
+import numpy as np
 from gen.diffusion.sde_utils import SDESolver, NoiseSchedule
-from gen.diffusion.utils import ode_sampler, PDFSampler
-from gen.diffusion.likelihood import  get_likelihood_fn
+from gen.diffusion.utils import ode_sampler, PDFSampler, neg_force_wrapper
+from gen.diffusion.likelihood import  ODESampler
 
 
 
 class SDE(nn.Module):
-    def __init__(self,max_nsteps=1000,schedule="linear",beta_max=20,eps=1e-4,periodic_boxlen=None,translation_inv=False,t_range=(1e-4,1),**kwargs):
+    def __init__(self,max_nsteps=500,schedule="linear",beta_max=20,eps=1e-4,
+                 periodic_boxlen=None,translation_inv=False,t_range=(1e-4,1),
+                 reverse_drift_correction=None,
+                 **kwargs):
         super().__init__()
         self.t_range = torch.clip(torch.tensor(t_range),min=eps)
         self.schedule = NoiseSchedule(type=schedule,max=beta_max,t_range=self.t_range)
+        self.reverse_drift_correction = reverse_drift_correction
         self.eps = eps
         self.max_nsteps = max_nsteps
         self.translation_inv = translation_inv
@@ -23,9 +28,10 @@ class SDE(nn.Module):
     def _batch_mult(self,coeff,data):
         return torch.einsum(data, [0,...],coeff,[0], [0,...])
 
-    def _apply_constraints(self,x):
+    def _apply_constraints(self,x,context=None):
         if self.translation_inv:
-            x = x - torch.mean(x,axis=1).unsqueeze(1)          
+            x_mean = torch.mean(x,axis=1).unsqueeze(1)
+            x = x - x_mean      
         if self.periodic_boxlen is not None:
             x = torch.remainder(x,self.periodic_boxlen)
         return x
@@ -39,26 +45,25 @@ class SDE(nn.Module):
             z.reshape(len(z),-1)**2,1)/2
         return logp
     
-    def reverse_sde(self, x, t, score_fn,ode=False):
+    def reverse_sde(self, x, t, score_fn,ode=False,**context_args):
         """Create the drift and diffusion functions for the reverse SDE/ODE."""
         x = self._apply_constraints(x)
         drift, diffusion = self.sde(x, t)
         with torch.enable_grad():
-            x.requires_grad_(True)
-            score = score_fn(x, t)
+            #x.requires_grad_(True)
+            score = score_fn(x, t,**context_args)
         drift = drift - diffusion** 2 * score * (0.5 if ode else 1.)
+        if self.reverse_drift_correction is not None:
+            drift = drift + self.reverse_drift_correction(x, t)
         # Set the diffusion function to zero for ODEs.
         diffusion = torch.zeros_like(diffusion) if ode else diffusion
         return drift, diffusion
     
-    def reverse_drift(self,x,t,score_fn,ode=False):
+    def reverse_drift(self,x,t,score_fn,ode=False,**context_args):
         x = self._apply_constraints(x)
         drift, diffusion = self.sde(x, t)
-        #print("forward drift",drift[0])
-        score = score_fn(x, t)
-        #print("x/score",x[0]/score[0])
+        score = score_fn(x, t,**context_args)
         drift = drift - diffusion** 2 * score * (0.5 if ode else 1.)
-        #print(drift[0])
         return drift
     
     def sde(self,x,t):
@@ -76,19 +81,26 @@ class SDE(nn.Module):
             diffused_x = self._batch_mult(mean_coeff,x
                         )+self._batch_mult(sigma,std_noise)
             if torch.any(torch.isnan(dlogpdx)) or torch.any(torch.isinf(dlogpdx)):
-                print(t_final,t_init)
+                print("True score becomes nan:",t_final,t_init)
             diffused_x = self._apply_constraints(diffused_x)
-            output = {"diffused_x":diffused_x,"score":dlogpdx,"sigma":sigma}
+            output = {"diffused_x":diffused_x,"score":dlogpdx,"weight":sigma**2}
         else:
             assert hasattr(self, "sde_solver")
             with torch.no_grad():
-                diffused_x = self.sde_solver.solve(x,t_init=t_init,t_final=t_final)
+                diffused_x = self.sde_solver.solve(x,t_init=t_init,t_final=t_final,t_range=self.t_range)
             diffused_x = self._apply_constraints(diffused_x)
             output = {"diffused_x":diffused_x}
-            #utils.write_coord("forward_intermediate.xyz",diffused_x,nparticles=13)
         return output
+
+    def logp(self,x, score_fn):
+        ode =  ODESampler(self, score_fn)
+        x_prior, lj, traj = ode.forward(x)
+        prior_logp = self.prior_logp(x_prior)
+        logp = prior_logp+lj
+        return logp, x_prior, traj
+
+    def backward(self,x,score_fn,t_init=None,t_final=None, method="ode",return_prob=False,return_traj=False,**context_args):
         
-    def backward(self,x,score_fn,t_init=None,t_final=None, method="ode",return_prob=False,return_traj=False):
         if t_init is None:
             t_init = torch.full((len(x),),self.t_range[1]).to(x.device)
         if t_final is None:
@@ -100,17 +112,51 @@ class SDE(nn.Module):
         if len(t_final.shape)==0:
             t_final = t_final.unsqueeze(0).expand(len(x),).to(x.device)
         assert torch.any(t_init - t_final >= 0) 
-
         if method == "ode":
             if return_prob:
-                prob = get_likelihood_fn(noise_to_data=True)
-                logp, x, _ = prob(self,score_fn, x)
-                output = {"logp":logp,"x":x}
+                ode =  ODESampler(self, score_fn)
+                prior_logp = self.prior_logp(x)
+                x_final, lj = ode.reverse(x)
+                logp = prior_logp-lj
+                # prob = get_likelihood_fn(noise_to_data=True)
+                # logp, x, _ = prob(self,score_fn, x)
+                output = {"logp":logp,"x":x_final}
+                # nqueries_list = [1,10,100,200]
+                # for nqueries in nqueries_list:
+                #     ode = ODESampler(self, score_fn, nqueries=nqueries, trace_method="hutch")
+                #     prior_logp = self.prior_logp(x)
+                #     x, lj = ode.reverse(x)
+                #     logp = prior_logp-lj
+                #     np.save("logp_{}.npy".format(nqueries),logp.cpu().numpy())
             else:
-                drift_fn = lambda x, t: self.reverse_drift(x, t,score_fn, ode=True)
-                with torch.no_grad():
-                    output = ode_sampler(drift_fn, x, (t_init[0],t_final[0]),return_traj=return_traj)  
-            
+                        drift_fn = lambda x,t: self.reverse_drift(x,t,score_fn,ode=True,**context_args)
+                        output = ode_sampler(drift_fn, x, (t_init[0],t_final[0]),return_traj=return_traj) 
+                        # ode =  ODESampler(self, score_fn, return_jacobian=False)
+                        # x = ode.reverse(x) 
+                        # output = {"x":x}
+        elif method == "e-m":
+            t_seq = torch.linspace(t_init[0],t_final[0],self.max_nsteps).to(x.device)
+            # context = context_args.get("context",None)
+            # if context is not None: #Only implimented euler-maruyama for now
+            #     if context_idx is None:
+            #         context_idx = torch.arange(context.shape[1])
+            #     std_noise = torch.randn(len(t_seq),*context.shape).to(x.device)
+            #     std_noise = self._apply_constraints(std_noise)
+            #     context_traj = context.unsqueeze(0).expand(len(t_seq),*context.shape)
+            #     mean_coeff, sigma = self.marginal_prob(t_seq,0)
+            #     mean_coeff, sigma = mean_coeff.to(x.device), sigma.to(x.device)
+            #     noised_context_traj = self._batch_mult(mean_coeff,context_traj)+self._batch_mult(sigma,std_noise)
+            dt = 1/self.max_nsteps
+            for i,t in enumerate(t_seq):
+                #if context is not None:
+                    #x[:,context_idx] = noised_context_traj[i]
+                x = self._apply_constraints(x)
+                drift, diffusion = self.reverse_sde(x, t, score_fn,**context_args)
+                x_mean = x - drift * dt
+                x = x_mean - diffusion* math.sqrt(dt) * self._apply_constraints(torch.randn_like(x))
+            #if context is not None:
+                #x[:,context_idx] = noised_context_traj[i]
+            output = {"x":x_mean}    
         elif method == "sde":
             assert hasattr(self, "reverse_solver")
             x = x.requires_grad_(False)
@@ -122,11 +168,11 @@ class SDE(nn.Module):
             if return_traj:
                 traj=[]
             while torch.any(t-t_final>0):
-                snr = 0.10
+                snr = 0.16
                 mask = (t>t_final)
                 x = x.detach()
                 x = self._apply_constraints(x)
-                grad = score_fn(x[mask], t[mask])
+                grad = score_fn(x[mask], t[mask],**context_args)
                 grad_norm = torch.norm(grad.reshape(grad.shape[0], -1), dim=-1).mean()
                 noise_norm = torch.sqrt(torch.prod(torch.tensor(x.shape[1:])))
                 langevin_step_size = 2 * (snr * noise_norm / grad_norm)**2
@@ -134,16 +180,15 @@ class SDE(nn.Module):
                     * langevin_step_size) * self._apply_constraints(torch.randn_like(x[mask]))
                 #Predictor step (Euler-Maruyama)
                 x = self._apply_constraints(x)
-                drift, diffusion = self.reverse_sde(x[mask], t[mask], score_fn)
-
-                x_mean = x[mask] - drift * dt
+                drift, diffusion = self.reverse_sde(x[mask], t[mask], score_fn,**context_args)
+                x_mean = x[mask] - drift * dt + diffusion **2 * grad* dt
                 x[mask] = x_mean - diffusion* math.sqrt(dt) * self._apply_constraints(torch.randn_like(x[mask]))
                 if return_traj:
                     traj.append(x)
                 t = t-dt
-                output = {"x":x}
-                if return_traj:
-                    output.update({"traj":torch.stack(traj).transpose(0,1)})  
+            output = {"x":x}
+            if return_traj:
+                output.update({"traj":torch.stack(traj).transpose(0,1)})  
         return output
     
 class LinearSDE(SDE):
@@ -165,7 +210,10 @@ class LinearSDE(SDE):
             return self._t_generator().rvs(size=nsamples)
         else:
             return torch.rand(nsamples)*(self.t_range[1]-self.t_range[0])+self.t_range[0]
-        
+    
+    def prior(self, shape):
+        return torch.distributions.normal.Normal(torch.zeros(list(shape)), torch.ones(list(shape)))
+
     def sde(self,x,t):
         if len(t.shape)==0:
             t = t.unsqueeze(0).expand(len(x),).to(x.device)
@@ -178,20 +226,92 @@ class LinearSDE(SDE):
         std[mask] = self.marginal_prob(t[mask],t_init=self.t_range[0])[1]
         return std
 
-class PureDiffusion(SDE):
-    def __init__(self,D,max_nsteps=1000,eps=1e-4,**kwargs):
+class ToroidalDiffusion(LinearSDE):
+    def __init__(self,sigma_min=0.01,sigma_max=1,ncells=10,
+                 max_nsteps=1000,eps=1e-4,**kwargs):
         super().__init__(max_nsteps,eps=eps,**kwargs)
-        self.D = torch.tensor(D)
+        self.sigma_min = sigma_min*self.periodic_boxlen
+        self.sigma_max = sigma_max*self.periodic_boxlen
+        self.ncells = ncells
+        self.log_ratio = math.log(sigma_max/sigma_min)
         self.sde_solver = SDESolver(self.drift,self.diffusion)
+        self.register_buffer("d",torch.arange(-self.ncells,self.ncells+1)*self.periodic_boxlen)
+        self.mult_factor = 50000
+        self.register_buffer("std_noise", torch.randn(self.mult_factor,1))
 
+    def sigma(self,t):
+        return self.sigma_min**(1.-t)*self.sigma_max**(t)
+    
     def drift(self,x,t):
         return torch.zeros_like(x)
     
     def diffusion(self,x,t):
-        return torch.sqrt(2*self.D)*torch.ones_like(x)
+        if isinstance(t,float):
+            t = torch.tensor(t).to(x.device)
+        if len(t.shape)==0:
+            t = t.unsqueeze(0).expand(len(x),).to(x.device)
+        t_scaled = (t-self.t_range[0])/(self.t_range[1]-self.t_range[0])
+        sigma = self.sigma(t_scaled)
+        g_t = math.sqrt(2*self.log_ratio)*sigma
+        return self._batch_mult(g_t,torch.ones_like(x))
+
+    def prior(self, shape):
+        class UniformDistribution(torch.distributions.Uniform):
+            def __init__(self,shape,boxlen):
+                super().__init__(-0.5*boxlen,0.5*boxlen)
+                self.shape = shape
+                self.boxlen = boxlen
+                self.dim = self.shape[-1]
+            def sample(self,nsamples):
+                if isinstance(nsamples,tuple):
+                    nsamples = nsamples[0]
+                return self.rsample((nsamples,)+self.shape)
+
+            def log_prob(self,x):
+                return 1/(self.boxlen**self.dim)*torch.ones(len(x)).to(x.device)
+
+        assert self.periodic_boxlen is not None 
+        return UniformDistribution(shape,self.periodic_boxlen)            
+
+    def _calc_score(self,displacement,sigma):
+        displacement_flat = (displacement).reshape(len(displacement),-1)
+        
+        d_expanded = self.d[None,None,:].expand(len(displacement_flat),displacement_flat.shape[1],self.d.shape[-1])
+        d_expanded = d_expanded.to(displacement.device)
+        displacement_flat_expanded = displacement_flat[:,:,None].expand_as(d_expanded)
+        prob = torch.exp((displacement_flat_expanded-d_expanded)**2/(-2*sigma[:,None,None]**2))
+        prob_weighted= (-displacement_flat_expanded+d_expanded)/sigma[:,None,None]**2*prob
+        score = 1/torch.sum(prob,axis=-1)*torch.sum(prob_weighted,axis=-1)
+        return score.reshape(displacement.shape)
+
+    def forward(self,x,t_final,t_init=0):
+        assert torch.any(t_final - t_init >= 0)  
+        sigma = self.sigma(t_final)
+        std_noise = torch.randn_like(x).to(x.device)
+        noise = self._batch_mult(sigma,std_noise)
+        diffused_x = x + noise
+        diffused_x = self._apply_constraints(diffused_x)
+        score = self._calc_score(diffused_x-x,sigma)
+        mult_factor = 1000
+        mult_noise = torch.randn(mult_factor*x.shape[0],*x.shape[1:]).to(x.device)
+        mult_sigma = sigma.repeat(mult_factor)
+        mult_noise = self._batch_mult(mult_sigma,mult_noise)%self.periodic_boxlen
+        mult_score = self._calc_score(mult_noise,mult_sigma).reshape(mult_factor,len(x),-1)
+        avg_score_norm = torch.mean(torch.sum(mult_score**2,axis=-1),axis=0)
+        return {"diffused_x":diffused_x,"score":score,"weight":1/avg_score_norm}
     
+    def std_fn(self,t):
+        mult_factor = self.mult_factor//len(t)
+        mult_noise = self.std_noise[:len(t)*mult_factor].to(t.device)
+        sigma = self.sigma(t)
+        mult_sigma = sigma.repeat(mult_factor)
+        mult_noise = self._batch_mult(mult_sigma,mult_noise)%self.periodic_boxlen
+        mult_score = self._calc_score(mult_noise,mult_sigma).reshape(mult_factor,len(t),-1)
+        avg_score_norm = torch.sqrt(torch.mean(mult_score**2,axis=(0,-1)))
+        return 1/avg_score_norm
+
 class VP_SDE(LinearSDE):
-    def __init__(self,max_nsteps=1000,beta_max=20,eps=1e-3,schedule="linear",**kwargs):
+    def __init__(self,max_nsteps=1000,beta_max=20,eps=1e-4,schedule="linear",**kwargs):
         super().__init__(max_nsteps,schedule,eps=eps,beta_max=beta_max,**kwargs)
         self.sde_solver = SDESolver(self.drift,self.diffusion)
 
@@ -294,11 +414,12 @@ class PiecewiseSDE(SDE):
             if sde_type == "GeneralSDE":
                 diffusion_params.update({"f": copy.deepcopy(neg_force_wrapper(data_handler)), 
                                     "kT": kT, "friction": friction})
-            if sde_type == "PureDiffusion":
-                diffusion_params.update({"D": D})
             sde_i = eval(sde_type)(schedule=schedule, 
                 translation_inv=translation_inv,periodic_boxlen=periodic_boxlen, **dict(diffusion_params))
             self.sde_list.append(sde_i)
+
+    def prior(self, shape):
+        return self.sde_list[-1].prior(shape)
 
     def _sde_idx(self,t,forward=True):   
         t_diff = t.unsqueeze(1)-self.t_init_list.unsqueeze(0).to(t.device)
@@ -316,7 +437,8 @@ class PiecewiseSDE(SDE):
         drift = torch.zeros_like(x)
         for i in range(torch.max(sde_idx)+1):
             mask = (sde_idx==i)
-            drift[mask] = self.sde_list[i].drift(x[mask],t[mask])
+            if torch.sum(mask)>0:
+                drift[mask] = self.sde_list[i].drift(x[mask],t[mask])
         return drift
     
     def diffusion(self,x,t):
@@ -364,11 +486,3 @@ class PiecewiseSDE(SDE):
         else:
             return x
     
-def neg_force_wrapper(data_handler):
-    def f(x):
-        #x_decoded = data_handler.decoder(x.clone())
-        x_decoded = x.clone()
-        f = data_handler.distribution.neg_force_clipped(x_decoded)
-        #f = data_handler.encoder(f)
-        return f
-    return f

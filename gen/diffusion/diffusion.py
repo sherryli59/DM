@@ -1,12 +1,34 @@
 import torch
-from pytorch_lightning import LightningModule
+from pytorch_lightning import LightningModule, Callback
 from typing import Any
+import numpy as np
+
 
 from gen.diffusion import loss_fn
 from gen.diffusion.sde import *
-from gen.diffusion.likelihood import  get_likelihood_fn
+from gen.simulations.utils import write_coord
 
-
+class Resample(Callback):
+    #def on_train_start(self,trainer, pl_module):
+        #if pl_module.live:
+            #trainer.datamodule.dataset.start()
+            #trainer.datamodule.reload_data()
+    def on_train_epoch_end(self, trainer, pl_module):
+        # log best so far train loss
+        pl_module.metric_hist['train/loss'].append(
+            trainer.callback_metrics['train/loss'])
+        pl_module.log('train/loss_best',
+                 min(pl_module.metric_hist['train/loss']), prog_bar=False)
+        if pl_module.live:
+            if trainer.current_epoch>5:
+                with torch.no_grad():
+                    out = pl_module.sample(trainer.datamodule.dataset.sample_size,batch_size=50, method="ode", return_prob=True)
+                proposal = out["x"]
+                prob = out["logp"]
+                trainer.datamodule.dataset.update_proposals(proposal,prob,pl_module.likelihood_estimator)
+            trainer.datamodule.dataset.run()
+            trainer.datamodule.reload_data()
+    
 class BaseModule(LightningModule):
     def __init__(self):
         super().__init__()    
@@ -50,6 +72,7 @@ class BaseModule(LightningModule):
             self.trainer.callback_metrics['val/loss'])
         self.log('val/loss_best',
                  min(self.metric_hist['val/loss']), prog_bar=False)
+        
     
     def training_step(self, batch: Any, batch_idx: int):
         loss = self.step(batch)
@@ -66,28 +89,41 @@ class BaseModule(LightningModule):
     def test_step(self, batch: Any, batch_idx: int):
         return {'loss': self.step(batch)}
     
-    
-
-
-
 class DiffusionModel(BaseModule):
-    def __init__(self,score,sde,shape,data_handler=None,likelihood_weighting=False,
-                 eps = 1e-4, lr: float = 0.001,
-                weight_decay: float = 0.0005, **kwargs: Any):
+    def __init__(self,score,sde,shape,conditional=False,live=False,likelihood_weighting=False,
+                 eps = 1e-4, lr: float = 0.001, 
+                weight_decay: float = 0.0005,lattice=None, **kwargs: Any):
         super().__init__()    
         self.save_hyperparameters()
         self.eps = eps
-        self.data_handler = data_handler
         self.shape = shape
         self.likelihood_weighting = likelihood_weighting
         self.sde = sde
         self.score_fn = score.to(self.device)
-        if hasattr(self.sde, "sde_list"):
-            self.loss_fn = lambda x,t: loss_fn.piecewise_sde_loss(self.sde,self.score_fn,x,t)
+        self.conditional = conditional
+        self.lattice = lattice
+        self.live = live
+        if live:
+            self.likelihood_estimator = lambda x: self.logp(x)
+        if conditional:
+            self.loss_fn = lambda x,t: loss_fn.conditional_loss(self.sde,self.score_fn,x,t,lattice=self.lattice)
         else:
-            self.loss_fn = lambda x,t: loss_fn.single_sde_loss(self.sde,self.score_fn,x,t)
+            if hasattr(self.sde, "sde_list"):
+                self.loss_fn = lambda x,t: loss_fn.piecewise_sde_loss(self.sde,self.score_fn,x,t)
+            else:
+                self.loss_fn = lambda x,t: loss_fn.single_sde_loss(self.sde,self.score_fn,x,t)
 
-               
+    def configure_callbacks(self):
+        resample = Resample()
+        return [resample]
+
+    def training_step(self, batch: Any, batch_idx: int):
+        loss = self.step(batch)
+        self.log('train/loss', loss, on_step=True,
+                  on_epoch=False, prog_bar=True)
+        return {'loss': loss}
+
+
     def generate_t(self,nsamples):
         if hasattr(self.sde, "sde_list"):
             t = torch.zeros(nsamples).to(self.device)
@@ -109,26 +145,46 @@ class DiffusionModel(BaseModule):
         return loss
     
     def test_step(self, batch: Any, batch_idx: int):
-        prob = get_likelihood_fn(noise_to_data=False)
-        logp, x, _ = prob(self.sde,self.score_fn, batch)
-        return {"logp":logp}
-
-    def sample(self,nsamples,method="ode",return_traj=False, return_prob=False,batchsize=100,init=None,t_init=None):
+        if batch_idx <= 1:
+            self.score_fn.correction.plot_schedule()
+        if self.conditional:
+            cell_idx = batch[...,0]
+            x = batch[...,1:]
+            #randomly select a cell
+            x1, x2 = self.lattice.select_adjacent_cells(x,cell_idx)
+            context = x2[0].unsqueeze(0).expand_as(x2)
+            out = self.sample(len(batch),context=context,method="e-m")
+            conditional_sample = torch.cat((context,out["x"]),dim=1)
+            np.save("conditional_sample_traj.npy",conditional_sample.detach().cpu().numpy())
+            write_coord("conditional_sample_traj.xyz",conditional_sample.detach().cpu().numpy(),
+                        nparticles=conditional_sample.shape[1])
+            np.save("simulated_sample_single.npy",batch[0].detach().cpu().numpy())
+            write_coord("simulated_sample_single.xyz",batch[0].detach().cpu().numpy(),
+                        nparticles=batch[0].shape[0])
+        else:
+            pass
+    
+    def logp(self,x):
+        with torch.no_grad():
+            return self.sde.logp(x,self.score_fn)[0]
+    
+    def sample(self,nsamples, method="ode",return_traj=False, return_prob=False,batch_size=100,init=None,t_init=None,context=None):
         self.score_fn = self.score_fn.to(self.device)
         if t_init is None:
             t_init = torch.full((nsamples,),1.).to(self.device)
         if init is None:
-            init = torch.randn([nsamples]+list(self.shape)).to(self.device)
-        if init is not None:
-            nsamples = init.shape[0]
-        if nsamples < batchsize:
-            batchsize = nsamples
-        for i in range(nsamples//batchsize):
-            start = i*batchsize
-            end = min((i+1)*batchsize,nsamples)
-            with torch.no_grad():
-                batch_out = self.sde.backward(init[start:end],score_fn=self.score_fn,
-                                        t_init=t_init[start:end],method=method,return_traj=return_traj,return_prob=return_prob)
+            shape = self.shape.copy()
+            dist = self.sde.prior(shape)
+            init = dist.sample((nsamples,)).to(self.device)
+        nsamples = init.shape[0]
+        if nsamples < batch_size:
+            batch_size = nsamples
+        for i in range(nsamples//batch_size):
+            start = i*batch_size
+            end = min((i+1)*batch_size,nsamples)
+            context_batch = context[start:end].to(self.device) if context is not None else None
+            batch_out = self.sde.backward(init[start:end],score_fn=self.score_fn, context=context_batch,
+                                    t_init=t_init[start:end],method=method,return_traj=return_traj,return_prob=return_prob)
             if i==0:
                 out = batch_out
             else:
@@ -137,16 +193,5 @@ class DiffusionModel(BaseModule):
         out.update({"init":init})
         return out
     
-    
-    
 
-
-
-def force_wrapper(data_handler):
-    def f(x):
-        x_decoded = data_handler.decoder(x.clone())
-        f = -data_handler.distribution.neg_force_clipped(x_decoded)
-        f = data_handler.encoder(f)
-        return f
-    return f
 

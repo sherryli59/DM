@@ -1,8 +1,9 @@
 import torch
+from torch import nn
 import numpy as np
 from scipy import integrate,interpolate
 from scipy.stats import rv_continuous
-
+import copy
 
 class PDFSampler(rv_continuous): 
     def __init__(self, pdf, a=None, b=None, **kwargs):
@@ -52,7 +53,8 @@ def ode_sampler(drift_fn,
         raise ValueError("NaN encountered")
     time_steps = np.ones((shape[0],)) * t   
     x = torch.tensor(x, device=device, dtype=torch.float32).reshape(shape)
-    time_steps = torch.tensor(time_steps, device=device, dtype=torch.float32).reshape((x.shape[0], ))    
+    time_steps = torch.tensor(time_steps, device=device, dtype=torch.float32).reshape((x.shape[0], )) 
+    
     drift = drift_fn(x, time_steps)
     return drift.detach().cpu().numpy().reshape((-1,)).astype(np.float64)
   if return_traj:
@@ -60,7 +62,7 @@ def ode_sampler(drift_fn,
   else:
       t_eval = None
   # Run the black-box ODE solver.
-  res = integrate.solve_ivp(ode_func, t_range, init_x.reshape(-1).cpu().numpy(),dt=1e-3, t_eval=t_eval,rtol=rtol, atol=atol, method='RK45')  
+  res = integrate.solve_ivp(ode_func, t_range, init_x.reshape(-1).cpu().numpy(),first_step=1e-3, max_step=1e-2,dt=1e-3,t_eval=t_eval,rtol=rtol, atol=atol, method='RK45')  
   print(f"Number of function evaluations: {res.nfev}")
   x = torch.tensor(res.y[:, -1], device=init_x.device).reshape(shape)
   if return_traj:
@@ -77,4 +79,120 @@ def from_flattened_numpy(x, shape):
     """Form a torch tensor with the given `shape` from a flattened numpy array `x`."""
     return torch.from_numpy(x.reshape(shape))
 
+def neg_force_wrapper(data_handler):
+    def f(x):
+        #x_decoded = data_handler.decoder(x.clone())
+        x_decoded = x.clone()
+        f = data_handler.distribution.neg_force_clipped(x_decoded)
+        #f = data_handler.encoder(f)
+        return f
+    return f
 
+def _batch_mult(coeff,data):
+        return torch.einsum(data, [0,...],coeff,[0], [0,...])
+
+class ReverseDriftCorrection(torch.nn.Module):
+    def __init__(self, data_handler, t_range, 
+                 friction=10, force_schedule_power=0.5):
+        super().__init__()
+        self.f = copy.deepcopy(neg_force_wrapper(data_handler))
+        self.friction = friction
+        self.t_range = t_range
+        self.duration = t_range[1]-t_range[0]
+        self.force_schedule_power = force_schedule_power
+    
+    def dec_coeff(self,t):
+        coeff = torch.zeros_like(t)
+        mask = (t>self.t_range[0])&(t<self.t_range[1])
+        coeff[mask] = 1-((t[mask]-self.t_range[0])/self.duration)**self.force_schedule_power
+        return coeff
+    
+    def forward(self,x,t):
+        if len(t.shape)==0:
+            t = t.unsqueeze(0).expand(len(x),).to(x.device)
+        force_coeff = self.dec_coeff(t)
+        drift = _batch_mult(force_coeff,self.f(x)/self.friction)
+        return drift
+    
+def get_lattice_and_neighbor(n_cells=3):
+    lattice = torch.stack(torch.meshgrid(torch.arange(n_cells),
+                    torch.arange(n_cells), torch.arange(n_cells)), dim=-1).reshape(-1, 3)
+    #find the index of the neighbor to the right of each cell
+    neighbor = lattice.clone()
+    neighbor[:,0] = (neighbor[:,0]+1)%n_cells
+    # match the neighbor index to the lattice index
+    neighbor_idx = torch.zeros(n_cells**3)
+    for i in range(n_cells**3):
+        neighbor_idx[i] = torch.where(torch.all(lattice==neighbor[i],dim=-1))[0]
+    return lattice,neighbor_idx
+
+class Lattice():
+    def __init__(self, boxlength, n_cells, device="cuda"):
+        super().__init__()
+        self.boxlength = boxlength
+        self.n_cells = n_cells
+        self.lattice, self.neighbor_idx = get_lattice_and_neighbor(n_cells)
+        self.lattice = self.lattice.float().to(device)
+        self.neighbor_idx = self.neighbor_idx.int().to(device)
+        self.cell_len = boxlength / n_cells
+        self.lattice = self.lattice.float() *self.cell_len - boxlength / 2 + self.cell_len/2
+
+    def polynomial_cutoff(self,x, cutoff, scale,power=3):
+        mask = (x<cutoff)
+        return mask.float()*scale*(x/cutoff)**power + (1-mask.float())*scale
+    
+    def scaled_confining_force(self,x,t,lattice_center=(0,0,0),max_force=10,buffer = 0.1):
+        max_force = max_force * (1-t)
+        # expand max_force to match the size of x
+        max_force = max_force.view(len(max_force), *(1,)*(x.ndim-1)).expand(x.shape)
+        buffer = buffer * self.cell_len + t * self.boxlength/2
+        buffer = buffer.view(len(buffer), *(1,)*(x.ndim-1)).expand(x.shape)
+        return self.confining_force(x,lattice_center,max_force,buffer)
+
+    def confining_force(self,x,lattice_center=(0,0,0),max_force=1,buffer = 0.1):
+        lattice_center = torch.tensor(lattice_center).to(x.device)
+        lattice_center = lattice_center.reshape(*(1,)*(x.ndim-1)+(-1,))
+        displacement = x - lattice_center
+        direction = -torch.sign(displacement)
+        #apply periodic boundary conditions
+        displacement -= ((torch.abs(displacement)> 0.5 * self.boxlength)
+                        * torch.sign(displacement) * self.boxlength)
+        displacement = torch.abs(displacement)
+        mask = (displacement>self.cell_len/2).int()
+        force = mask*self.polynomial_cutoff(displacement-self.cell_len/2,buffer*self.cell_len,max_force)
+        force = force*direction
+        return force
+    
+
+    def select_adjacent_cells(self,x,cell_idx):
+        cell1 = torch.randint(int(cell_idx.max().item()),(1,)).to(cell_idx.device)
+        cell2 = self.neighbor_idx[cell1].to(cell_idx.device)
+        mask = (cell_idx==cell1).unsqueeze(-1).expand(x.shape)
+        x1 = x[mask].reshape(x.shape[0],-1,x.shape[-1])
+        mask = (cell_idx==cell2).unsqueeze(-1).expand(x.shape)
+        x2 = x[mask].reshape(x.shape[0],-1,x.shape[-1])
+        #move x1 to the origin
+        displacement_vec = self.lattice[cell1]
+        x1 = x1-displacement_vec.unsqueeze(1)
+        x2 = x2-displacement_vec.unsqueeze(1)
+        boxlength = self.boxlength
+        x2 = x2%boxlength
+        x2 = x2-((torch.abs(x2)> 0.5 * boxlength)
+                * torch.sign(x2) * boxlength)
+        return x1,x2
+
+if __name__=="__main__":
+    import matplotlib.pyplot as plt
+    lattice = Lattice(8.7,3)
+    x = torch.linspace(-8.7/2,8.7/2,500).unsqueeze(1).repeat(1,3)
+    for t in torch.linspace(0,1,10):
+        t = torch.ones(len(x))*t
+        force = lattice.scaled_confining_force(x,t)
+        #print(force[:,0])
+        plt.plot(x[:,0].detach(),force[:,0].detach())
+    plt.show()
+    # cell_idx = torch.randint(3,(100,))
+    # x1,x2 = lattice.select_adjacent_cells(x,cell_idx)
+    # plt.scatter(x1[:,0,0],x1[:,0,1])
+    # plt.scatter(x2[:,0,0],x2[:,0,1])
+    # plt.show()

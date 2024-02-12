@@ -1,6 +1,6 @@
 import cupy as cp
 import math
-import gpu_polymer as p
+from gen.simulations import gpu_polymer as p
 
 class Polymer():
     def __init__(self):

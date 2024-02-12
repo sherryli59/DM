@@ -199,7 +199,7 @@ class EGNN(torch.nn.Module):
                                                                aggregation_method=self.aggregation_method))
         self.to(self.device)
 
-    def forward(self, x, t, edge_index=None, node_mask=None, edge_mask=None, update_coords_mask=None, update_features_mask=None):
+    def forward(self, x, t, context=None, edge_index=None, node_mask=None, edge_mask=None, update_coords_mask=None, update_features_mask=None):
         n_configs = x.shape[0]
         if edge_index is None:
             batch = torch.arange(x.shape[0], device=x.device).reshape(-1,1).tile((1,x.shape[1])).flatten()
@@ -211,6 +211,9 @@ class EGNN(torch.nn.Module):
             h = torch.cat([h,t],dim=2)
         else:
             h = t[:,None,None].expand(n_configs,x.shape[1],1)
+        if context is not None:
+            context = context[:,None,:].expand(n_configs,x.shape[1],context.shape[1])
+            h = torch.cat([h,context],dim=2)
         x = x.flatten(0,1)
         h = h.flatten(0,1)
         edge_index = get_edges(batch,x,edge_cutoff=self.cutoff)
@@ -285,22 +288,17 @@ def unsorted_segment_sum(data, segment_ids, num_segments, normalization_factor, 
     return result
 
 if __name__=="__main__":
-    model = EGNN(1,256, n_layers=1)
+    context_dim = 2
+    model = EGNN(context_dim+1,256, n_layers=1)
     x = torch.randn(2,2,3).to("cuda")
     x.requires_grad=True
     t = torch.rand(2).to("cuda")
-    t2 = torch.rand(2).to("cuda")
-    y = model(x,t)
-    eps = torch.randn([1]+list(x.shape)).to(x.device)
-    fn_eps = torch.sum(y.unsqueeze(0) * eps, dim=tuple(range(1, len(x.shape)+1)))
-    print(torch.autograd.grad(y, x,torch.ones_like(y))[0])
-    y2 = model(x,t2)
-    print(y)
-    print(y-y2)
+    context = torch.randn(2,context_dim).to("cuda")
+    y = model(x,t,context=context)
     x_flipped = torch.flip(x,[1])
-    print(model(x_flipped,t)-torch.flip(y,[1]))
+    print(model(x_flipped,t,context)-torch.flip(y,[1]))
     #rotate 90 degrees
     rotation_mat = torch.tensor([[0,1,0],[-1,0,0],[0,0,1]]).float().unsqueeze(0).expand(x.shape[0],-1,-1)
     rotation_mat = rotation_mat.to("cuda")
     x_rotated = torch.einsum("bij,bjk->bik",x,rotation_mat)
-    print(model(x_rotated,t)-torch.einsum("bij,bjk->bik",y,rotation_mat))
+    print(model(x_rotated,t,context)-torch.einsum("bij,bjk->bik",y,rotation_mat))

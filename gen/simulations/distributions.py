@@ -1,5 +1,6 @@
 #from lammps import lammps, PyLammps, LMP_STYLE_ATOM, LMP_TYPE_ARRAY
 import torch
+import torch.nn as nn
 import numpy as np
 import random
 from torch.distributions import MultivariateNormal, Normal
@@ -9,20 +10,20 @@ from numbers import Number
 from torch.distributions import Distribution, constraints
 from torch.distributions.utils import broadcast_all
 
-from dm.simulations import utils
+from gen.simulations import utils
 
 
 
-class GaussianMixture:
-    def __init__(self, centers, std, npoints=None,dim=3,device="cpu"):
+class GaussianMixture(nn.Module):
+    def __init__(self, centers, std, npoints=None,dim=3):
+        super().__init__()
         self.dim = dim
-        self.device = device
         if isinstance(centers,str):
-            self.centers = utils.load_position(centers).reshape(-1,dim).to(self.device)
+            self.register_buffer("centers",utils.load_position(centers).reshape(-1,dim))
         else:
-            self.centers=torch.tensor(centers).float().to(self.device)    
+            self.register_buffer("centers",torch.tensor(centers).float())
         self.ncenters=len(self.centers)
-        self.var = (torch.tensor(std)**2).float().to(self.device)
+        self.register_buffer("var",torch.tensor(std).float())
         if self.var.dim()==0:
             self.var = self.var.expand(self.ncenters)
         if npoints == None:
@@ -31,7 +32,7 @@ class GaussianMixture:
             self.nparticles = npoints
         self.dist=[]
         for i in range(self.ncenters):
-            self.dist.append(MultivariateNormal(self.centers[i], self.var[i]*torch.eye(self.dim).to(self.device)))
+            self.dist.append(MultivariateNormal(self.centers[i], self.var[i]*torch.eye(self.dim).to(self.centers.device)))
 
     def pair_dist(self,pos):
         pair_vec = (pos.unsqueeze(-2) - pos.unsqueeze(-3))
@@ -59,7 +60,7 @@ class GaussianMixture:
                 return samples
 
     def log_prob(self,x):
-        x=x.reshape(-1,self.dim)
+        x=x.reshape(-1,self.dim).to(self.centers.device)
         for i in range(self.ncenters):
             if i==0:
                 prob=1/self.ncenters*torch.exp(self.dist[i].log_prob(x))

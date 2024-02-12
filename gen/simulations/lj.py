@@ -27,11 +27,12 @@ class SimData():
 class LJ(SimData):
     def __init__(self, pos_dir=None, boxlength=None, device="cuda:0",
                   epsilon=1., sigma=1., cutoff=None, shift=True,
-                  periodic=True, max_r=None):
+                  periodic=True, max_r=None, dim=3):
         super().__init__(pos_dir,device)
         self.epsilon=epsilon
         self.sigma=sigma
         self.cutoff=cutoff
+        self.dim = dim
         self.shift=shift
         self.boxlength=boxlength
         self.periodic=periodic
@@ -76,19 +77,20 @@ class LJ(SimData):
         total_potential = torch.sum(pair_potential,axis=(-1,-2))/2 
         return total_potential   
 
-    def neg_force_clipped(self,particle_pos,max_val=80):
-        if torch.any(torch.isnan(particle_pos)):
-            exit()
-        com = torch.mean(particle_pos,axis=1)
-        rel_pos = particle_pos-com.unsqueeze(1)
-        harm_f = -0.05*(2*rel_pos/self.boxlength)**3
-        r = torch.linalg.norm(rel_pos,axis=-1)
-        if self.max_r is not None:
-            boundary_f = (100*(r>self.max_r)*(self.max_r-r)/(r+1e-6)).unsqueeze(-1)*rel_pos
-        else:
-            boundary_f = 0
-        lj_force = torch.clip(self.force(particle_pos,sig=1,eps=1,min_dist=0.1),-max_val,max_val)
-        return -torch.clip(lj_force+harm_f,-max_val,max_val)-boundary_f
+    # def neg_force_clipped(self,particle_pos,max_val=80):
+    #     com = torch.mean(particle_pos,axis=1)
+    #     rel_pos = particle_pos-com.unsqueeze(1)
+    #     harm_f = -0.05*(2*rel_pos/self.boxlength)**3
+    #     r = torch.linalg.norm(rel_pos,axis=-1)
+    #     if self.max_r is not None:
+    #         boundary_f = (100*(r>self.max_r)*(self.max_r-r)/(r+1e-6)).unsqueeze(-1)*rel_pos
+    #     else:
+    #         boundary_f = 0
+    #     lj_force = torch.clip(self.force(particle_pos,sig=1,eps=1,min_dist=0.1),-max_val,max_val)
+    #     return -torch.clip(lj_force+harm_f,-max_val,max_val)-boundary_f
+    
+    def force_clipped(self,particle_pos,max_val=80):
+        return self.force(particle_pos).clamp(-max_val,max_val)
     
     def force(self,particle_pos,sig=None, eps=None,min_dist=None):
         """
@@ -125,6 +127,15 @@ class LJ(SimData):
         force_mag = force_mag * distances_inverse
         force = -force_mag.unsqueeze(-1) * pair_vec
         total_force = torch.sum(force, dim=1)
+        com = torch.mean(particle_pos,axis=1)
+        rel_pos = particle_pos-com.unsqueeze(1)
+        harm_f = -0.05*(2*rel_pos/self.boxlength)**3
+        if not self.periodic:
+            total_force += harm_f
+        # r = torch.linalg.norm(rel_pos,axis=-1)
+        # if self.max_r is not None:
+        #      boundary_f = (100*(r>self.max_r)*(self.max_r-r)/(r+1e-6)).unsqueeze(-1)*rel_pos
+        #      total_force += boundary_f
         return total_force
 
     def log_prob(self,x):
@@ -155,8 +166,8 @@ class LJ(SimData):
                 areas = math.pi*(bins[1:]**2-bins[:-1]**2)
             elif dim == 3:
                 bulk_density = nparticles/(self.boxlength**3)
-                areas = 4*math.pi*bins[1:]**2
-            g_r = counts/(nparticles-1)**2/nsamples/areas/bulk_density
+                areas = 4/3*math.pi*(bins[1:]**3-bins[:-1]**3)
+            g_r = counts/nparticles/nsamples/areas/bulk_density
         else:
             com = torch.mean(particle_pos,axis=1)
             dist_from_com = torch.linalg.norm(particle_pos-com.unsqueeze(1),axis=-1)

@@ -13,6 +13,7 @@ def sliced_score_matching(score_fn, samples, t, n_eps=1):
         grad = torch.autograd.grad(scorev, dup_samples, create_graph=True)[0]    
         
     trace = torch.sum((rand_v * grad).view(grad.shape[0],-1), dim=-1)
+    #print(norm.view(n_eps, -1).std(dim=0))
     norm = norm.view(n_eps, -1).mean(dim=0)
     trace = trace.view(n_eps, -1).mean(dim=0)
     loss = norm/ 2. + trace
@@ -39,7 +40,7 @@ def loss_from_sde_output(sde_output,score_fn,t):
             diffused_x = diffused_x.detach().requires_grad_(True)
             predicted_score = score_fn(diffused_x,t)
         score = sde_output["score"]
-        weights = sde_output["sigma"]**2
+        weights = sde_output["weight"]
         score_diff = predicted_score-score.detach()
         score_diff = score_diff.reshape(len(score_diff),-1)
         loss = torch.mean(weights*torch.mean(score_diff**2,axis=-1))
@@ -52,13 +53,53 @@ def loss_from_sde_output(sde_output,score_fn,t):
                 predicted_score.shape[0],-1), dim=-1)
             loss = norm/2.+trace
         else: # sliced score matching
-            loss = sliced_score_matching(score_fn,diffused_x,t, n_eps=3)
+            loss = sliced_score_matching(score_fn,diffused_x,t, n_eps=5)
     return loss
 
 def single_sde_loss(sde,score_fn,x,t):
     sde_output = sde(x,t)
     loss = loss_from_sde_output(sde_output,score_fn,t)
     return loss
+
+def conditional_loss(sde,score_fn,x,t,lattice):
+    #assume the first column is cell index
+    cell_idx = x[...,0]
+    x = x[...,1:]
+    #randomly select two adjacent cells
+    x1,x2 = lattice.select_adjacent_cells(x,cell_idx)
+    sde_output = sde(x1,t)
+    diffused_x = sde_output["diffused_x"]
+    with torch.enable_grad():
+        diffused_x = diffused_x.detach().requires_grad_(True)
+        predicted_score = score_fn(diffused_x,t,context=x2,lattice=lattice)
+    score = sde_output["score"]
+    weights = sde_output["weight"]
+    score_diff = predicted_score-score.detach()
+    score_diff = score_diff.reshape(len(score_diff),-1)
+    loss = torch.mean(weights*torch.mean(score_diff**2,axis=-1))
+    return loss
+
+
+def conditional_loss_half(sde,score_fn,x,t):
+    #randomly partition the particles into two groups
+    nparticles = x.shape[1]
+    mask = torch.randperm(nparticles)<nparticles//2
+    x1 = x[:,mask]
+    x2 = x[:,~mask] #x2 is the context
+    sde_output = sde(x1,t)
+    diffused_x = sde_output["diffused_x"]
+    with torch.enable_grad():
+        diffused_x = diffused_x.detach().requires_grad_(True)
+        predicted_score = score_fn(diffused_x,t,context=x2,mask=mask)
+    score = sde_output["score"]
+    weights = sde_output["weight"]
+    score_diff = predicted_score-score.detach()
+    score_diff = score_diff.reshape(len(score_diff),-1)
+    loss = torch.mean(weights*torch.mean(score_diff**2,axis=-1))
+    return loss
+
+
+
 
 def piecewise_sde_loss(sde,score_fn,x,t):
     sde_output, sde_idx  = sde(x,t)

@@ -2,7 +2,7 @@ import torch
 from torchsde import sdeint, sdeint_adjoint
 import torch.nn as nn 
 import matplotlib.pyplot as plt
-from dm.simulations import utils
+from gen.simulations import utils
 
 import numpy as np
 
@@ -36,7 +36,7 @@ class SDESolver():
         self.solver = sdeint_adjoint if adjoint else sdeint
         self.dt = dt
 
-    def solve(self,x0,t_init:float,t_final,t_range=(0,1),save_sample_traj=True,**kwargs):
+    def solve(self,x0,t_init:float,t_final,t_range=(0,1),save_sample_traj=False,**kwargs):
         shape = torch.tensor(x0.shape[1:])
         if isinstance(t_final,float):
             t_final = torch.tensor([t_final]).to(x0.device)
@@ -56,10 +56,10 @@ class SDESolver():
         order = order[order!=0]
         x0 = x0.reshape(len(x0),-1)
         if save_sample_traj:
-            t = torch.linspace(t_init,float(t_final[0]),100).to(x0.device)
+            t = torch.linspace(t_range[0],t_range[1],int(500*(t_range[1]-t_range[0]))).to(x0.device)
             traj_sample = sdeint(fn, x0, t, dt=self.dt, method=self.method)
-            utils.write_coord("forward_traj.xyz",traj_sample.reshape([-1,len(x0)]+list(shape))[:,0],nparticles=20)
-            np.save("forward_traj.npy",traj_sample.detach().cpu().numpy())
+            #utils.write_coord("forward_traj_%.4f.xyz"%t_init,traj_sample.reshape([-1,len(x0)]+list(shape))[:,0],nparticles=20)
+            np.save("forward_traj_%.4f.npy"%t_init,traj_sample.detach().cpu().numpy())
         traj = sdeint(fn, x0, unique_t, dt=self.dt, method=self.method)
         traj = traj[inverse_indices]
         traj = traj[order]
@@ -70,13 +70,13 @@ class SDESolver():
 
 
 class NoiseSchedule():
-    def __init__(self,min=0.1,max=20,t_range=(0,1), type="quadratic"):
+    def __init__(self,min=0.1,max=15,t_range=(0,1), type="linear"):
         '''
         min: noise at time 0
         max: noise at time 1
         t_range: range of integration
         '''
-        print("NoiseSchedule: min={}, max={}, t_range={}".format(min,max,t_range))
+        #print("NoiseSchedule: min={}, max={}, t_range={}".format(min,max,t_range))
         self.t_range = t_range
         if type == "linear":
             self.beta_schedule = FixedLinearSchedule(min=min, max=max)
@@ -114,7 +114,7 @@ class QuadraticSchedule(nn.Module):
         return self._cumulate_from_0(t) - self._cumulate_from_0(t_init)
     
 class FixedLinearSchedule(nn.Module):
-    def __init__(self,min=0.1, max=20):
+    def __init__(self,min=0.1, max=15):
         super().__init__()
         self.min = min
         self.max = max

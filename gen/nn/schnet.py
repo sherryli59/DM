@@ -10,6 +10,45 @@ import math
 
 __all__ = ["SchNet", "SchNetInteraction"]
 
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
 def shifted_softplus(x: torch.Tensor):
     r"""Compute shifted soft-plus activation function.
     .. math::
@@ -283,8 +322,10 @@ class SchNet(nn.Module):
 
     def __init__(
         self,
-        n_atom_basis: int = 128,
-        n_interactions: int = 1,
+
+        n_atom_basis: int = 64,
+        n_time_basis: int = 64,
+        n_interactions: int = 3,
         n_radial_basis: int = 20,
         cutoff : float = 5,
         radial_basis_type: str = "gaussian",
@@ -294,7 +335,6 @@ class SchNet(nn.Module):
         dim = 3,
         boxlength = None,
         activation: Callable = shifted_softplus,
-        atomic_numbers = None
     ):
         """
         Args:
@@ -311,8 +351,11 @@ class SchNet(nn.Module):
         """
         super().__init__()
         self.n_atom_basis = n_atom_basis
-        self.size = (self.n_atom_basis,)
-        self.n_filters = n_filters or self.n_atom_basis
+        self.n_time_basis = n_time_basis
+        self.n_basis = n_atom_basis + n_time_basis
+        self.size = (self.n_basis,)
+        self.n_filters = n_filters or self.n_basis
+        self.dim = dim
         if radial_basis_type == "bessel":
             self.radial_basis = BesselRBF(n_radial_basis, cutoff)
         elif radial_basis_type == "gaussian":
@@ -321,18 +364,24 @@ class SchNet(nn.Module):
         self.cutoff_fn = CosineCutoff(cutoff)
         self.cutoff = cutoff
         self.boxlength = boxlength
-        self.atomic_numbers = atomic_numbers
-        self.energy_predictor = nn.Sequential(Dense(self.n_atom_basis, 
-                self.n_atom_basis//2, activation=activation),
-                Dense(self.n_atom_basis//2, 1, activation=None))
+        self.energy_predictor = nn.Sequential(Dense(self.n_basis, 
+                self.n_basis//2, activation=activation),
+                Dense(self.n_basis//2, 1, activation=None))
+        self.norm = nn.LayerNorm(dim,elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),nn.Linear(n_time_basis, 2 * dim, bias=True))
+        self.energy_shift = nn.Sequential(Dense(self.dim, 
+                self.n_basis//2, activation=activation),
+                Dense(self.n_basis//2, 1, activation=None))
         self.sum = lambda x: torch.einsum("b...->b", x)
         
         # layers
-        self.embedding = nn.Embedding(max_z, self.n_atom_basis, padding_idx=0)
+        self.atom_embedding = nn.Embedding(max_z, self.n_atom_basis, padding_idx=0)
+        self.time_embedding = TimestepEmbedder(self.n_time_basis)
 
         self.interactions = replicate_module(
             lambda: SchNetInteraction(
-                n_atom_basis=self.n_atom_basis,
+                n_atom_basis=self.n_basis,
                 n_rbf=self.radial_basis.n_rbf,
                 n_filters=self.n_filters,
                 activation=activation,
@@ -341,33 +390,50 @@ class SchNet(nn.Module):
             shared_interactions,
         )
     
-    def forward(self, positions,t=None):
-        if t is None:
-            t = torch.ones(positions.shape[0], device=positions.device)
-        r_ij  = (positions.unsqueeze(-2) - positions.unsqueeze(-3))
-        eps = 1e-6
-        d_ij = (r_ij.pow(2).sum(dim=-1) + eps).sqrt()
-        n_atoms = positions.shape[1]
-        mask = (torch.eye(n_atoms) == 0).to(positions.device)
-        d_ij = d_ij.masked_select(mask).view((-1, n_atoms, n_atoms - 1))
-        distance_to_origin = torch.norm(positions, dim=-1).unsqueeze(-1)
-        d_ij = torch.cat((d_ij,distance_to_origin),dim=-1)
-        if self.boxlength is not None:
-            to_subtract = ((torch.abs(d_ij) > 0.5 * self.boxlength)
-                * torch.sign(d_ij) * self.boxlength)
-            d_ij = d_ij - to_subtract
-        f_ij = self.radial_basis(d_ij)
-        dcut_ij = self.cutoff_fn(d_ij)
-
-        # compute atom and pair features
-        x = self.embedding(self.atomic_numbers).unsqueeze(0)
-        x = x* t[...,None,None].expand(-1, positions.shape[1], self.n_atom_basis)
-        # compute interaction block to update atomic embeddings
-        for interaction in self.interactions:
-            v = interaction(x, f_ij, dcut_ij)
-            x = x + v 
+    def forward(self, positions,t=None,atomic_numbers=None,box_vector=None):
+        try:
+            positions.requires_grad_(True)
+        except:
+            pass
         with torch.enable_grad():
+            if t is None:
+                t = torch.ones(positions.shape[0], device=positions.device)
+            if atomic_numbers is None:
+                atomic_numbers = torch.ones(*positions.shape[:2], device=positions.device).long()
+            r_ij  = (positions.unsqueeze(-2) - positions.unsqueeze(-3))
+            eps = 1e-6
+            d_ij = (r_ij.pow(2).sum(dim=-1) + eps).sqrt()
+            n_atoms = positions.shape[1]
+            mask = (torch.eye(n_atoms) == 0).to(positions.device)
+            d_ij = d_ij.masked_select(mask).view((-1, n_atoms, n_atoms - 1))
+            distance_to_origin = torch.norm(positions, dim=-1).unsqueeze(-1)
+            d_ij = torch.cat((d_ij,distance_to_origin),dim=-1)
+            if self.boxlength is not None:
+                d_ij = d_ij % self.boxlength
+                to_subtract = ((torch.abs(d_ij) > 0.5 * self.boxlength)
+                    * torch.sign(d_ij) * self.boxlength)
+                d_ij = d_ij - to_subtract
+            f_ij = self.radial_basis(d_ij)
+            dcut_ij = self.cutoff_fn(d_ij)
+
+            # compute atom and pair features
+            x = self.atom_embedding(atomic_numbers)
+            t_emb = self.time_embedding(t).unsqueeze(1).expand(-1,n_atoms,-1)
+            x = torch.cat((x,t_emb),dim=-1)
+            # compute interaction block to update atomic embeddings
+            for interaction in self.interactions:
+                v = interaction(x, f_ij, dcut_ij)
+                x = x + v 
             energy = self.sum(self.energy_predictor(x))
+            if box_vector is not None:
+                displacement = positions-box_vector.unsqueeze(-2)
+                #layer normalization
+                displacement = self.norm(displacement)
+                #modulation
+                shift, scale = self.adaLN_modulation(t_emb).chunk(2, dim=-1)
+                displacement = displacement * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+                energy = energy + self.sum(
+                    self.energy_shift(displacement))
             score = -torch.autograd.grad(energy, positions, 
-                                        grad_outputs=torch.ones_like(energy),retain_graph=True,create_graph=True)[0]  
+                        grad_outputs=torch.ones_like(energy),retain_graph=True,create_graph=True)[0]  
             return score

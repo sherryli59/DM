@@ -220,8 +220,8 @@ class VectorField(nn.Module):
         self._neg_log_gammas_time = self._neg_log_gammas_time.to(t.device)
         rbfs, d_rbfs = rbf_kernels(d, self._mus, self._neg_log_gammas, derivative=derivative)
         force_mag = (rbfs + importance.pow(2).view(1, 1, 1, -1)) @ self._weights + self._bias
-        if torch.any(torch.isnan(force_mag)):
-            raise ValueError("force_mag is nan")
+        #if torch.any(torch.isnan(force_mag)):
+        #    raise ValueError("force_mag is nan")
         if derivative:
             d_force_mag = (d_rbfs) @ self._weights
         else:

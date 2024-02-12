@@ -118,7 +118,8 @@ class LinearAttention(nn.Module):
 class Unet(nn.Module):
     def __init__(
         self,
-        dim,
+        dim = 32,
+        time_dim = 256,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
         channels = 3,
@@ -134,12 +135,11 @@ class Unet(nn.Module):
         in_out = list(zip(dims[:-1], dims[1:]))
 
         if with_time_emb:
-            time_dim = dim
             self.time_mlp = nn.Sequential(
-                SinusoidalPosEmb(dim),
-                nn.Linear(dim, dim * 4),
+                SinusoidalPosEmb(time_dim),
+                nn.Linear(time_dim, time_dim),
                 nn.GELU(),
-                nn.Linear(dim * 4, dim)
+                nn.Linear(time_dim, time_dim)
             )
         else:
             time_dim = None
@@ -179,10 +179,8 @@ class Unet(nn.Module):
             ConvNextBlock(dim, dim),
             nn.Conv2d(dim, out_dim, 1)
         )
-    def set_sdv(self,sdv):
-        self.sdv=sdv
 
-    def forward(self, x, time):
+    def forward(self, x, time=None):
         orig_x = x
         t = self.time_mlp(time) if exists(self.time_mlp) else None
         h = []
@@ -205,11 +203,10 @@ class Unet(nn.Module):
             x = upsample(x)
         if self.residual:
             return self.final_conv(x) + orig_x
-        x = torch.einsum(self.final_conv(x),[0,...],1/self.sdv(time),[0],[0,...])
-        return x
+        return self.final_conv(x)
 
 if __name__ =="__main__":
     s = Unet(dim=64,channels=2)    
-    x = torch.randn(3,2,24,24)
+    x = torch.randn(3,2,32,32).to("cuda:0")
     t = 0.5*torch.ones(3)
-    print(s(x,t))
+    print(s(x,t).shape)
