@@ -9,10 +9,10 @@ from gen.diffusion.sde import *
 from gen.simulations.utils import write_coord
 
 class Resample(Callback):
-    #def on_train_start(self,trainer, pl_module):
-        #if pl_module.live:
-            #trainer.datamodule.dataset.start()
-            #trainer.datamodule.reload_data()
+    def on_train_start(self,trainer, pl_module):
+        if pl_module.live:
+            trainer.datamodule.dataset.start()
+            trainer.datamodule.reload_data()
     def on_train_epoch_end(self, trainer, pl_module):
         # log best so far train loss
         pl_module.metric_hist['train/loss'].append(
@@ -20,9 +20,9 @@ class Resample(Callback):
         pl_module.log('train/loss_best',
                  min(pl_module.metric_hist['train/loss']), prog_bar=False)
         if pl_module.live:
-            if trainer.current_epoch>5:
+            if trainer.current_epoch>20:
                 with torch.no_grad():
-                    out = pl_module.sample(trainer.datamodule.dataset.sample_size,batch_size=50, method="ode", return_prob=True)
+                    out = pl_module.sample(trainer.datamodule.dataset.sample_size,batch_size=10, method="ode", return_prob=True)
                 proposal = out["x"]
                 prob = out["logp"]
                 trainer.datamodule.dataset.update_proposals(proposal,prob,pl_module.likelihood_estimator)

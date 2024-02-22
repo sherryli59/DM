@@ -184,7 +184,7 @@ class SDE(nn.Module):
                 x_mean = x[mask] - drift * dt + diffusion **2 * grad* dt
                 x[mask] = x_mean - diffusion* math.sqrt(dt) * self._apply_constraints(torch.randn_like(x[mask]))
                 if return_traj:
-                    traj.append(x)
+                    traj.append(x.clone())
                 t = t-dt
             output = {"x":x}
             if return_traj:

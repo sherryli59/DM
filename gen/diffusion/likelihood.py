@@ -54,7 +54,6 @@ class ODEFunc(nn.Module):
                 self._eps = torch.randn_like(x)
 
     def forward(self, t, state):
-        print(t)
         x, ldj, reg_term = state
         self.num_evals += 1
         with torch.set_grad_enabled(True):

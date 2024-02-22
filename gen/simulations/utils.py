@@ -62,6 +62,7 @@ def write_coord(file_dir,traj,atom_index=None,dim=None,append=False):
         atom_index=np.ones((len(traj),nparticles))
     elif len(atom_index.shape)==1:
         atom_index=atom_index.reshape(1,-1).repeat(len(traj),axis=0)
+
     with open(file_dir, 'a') as pos:
         for j in range(len(traj)):
                 pos.write('%d\n'%nparticles)

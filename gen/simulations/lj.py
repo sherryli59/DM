@@ -27,7 +27,7 @@ class SimData():
 class LJ(SimData):
     def __init__(self, pos_dir=None, boxlength=None, device="cuda:0",
                   epsilon=1., sigma=1., cutoff=None, shift=True,
-                  periodic=True, max_r=None, dim=3):
+                  periodic=True, max_r=None, dim=3, harm_coeff=0.5):
         super().__init__(pos_dir,device)
         self.epsilon=epsilon
         self.sigma=sigma
@@ -36,7 +36,8 @@ class LJ(SimData):
         self.shift=shift
         self.boxlength=boxlength
         self.periodic=periodic
-        self.max_r = self.boxlength/2 if max_r is None else max_r
+        self.harm_coeff = harm_coeff
+        #self.max_r = self.boxlength/2 if max_r is None else max_r
 
     def potential(self,particle_pos, min_dist=None):
         """
@@ -74,20 +75,14 @@ class LJ(SimData):
             pair_potential = self.epsilon * 4 * (torch.pow(pow_6, 2)
                                         - pow_6)
         pair_potential = pair_potential *distances_inverse*distances
-        total_potential = torch.sum(pair_potential,axis=(-1,-2))/2 
+        total_potential = torch.sum(pair_potential,axis=(-1,-2)) 
+        if not self.periodic:
+            com = torch.mean(particle_pos,axis=-2)
+            rel_pos = particle_pos-com.unsqueeze(1)
+            harm_potential = self.harm_coeff*torch.sum(0.5*rel_pos**2,axis=(-2,-1))
+            total_potential+=harm_potential
         return total_potential   
 
-    # def neg_force_clipped(self,particle_pos,max_val=80):
-    #     com = torch.mean(particle_pos,axis=1)
-    #     rel_pos = particle_pos-com.unsqueeze(1)
-    #     harm_f = -0.05*(2*rel_pos/self.boxlength)**3
-    #     r = torch.linalg.norm(rel_pos,axis=-1)
-    #     if self.max_r is not None:
-    #         boundary_f = (100*(r>self.max_r)*(self.max_r-r)/(r+1e-6)).unsqueeze(-1)*rel_pos
-    #     else:
-    #         boundary_f = 0
-    #     lj_force = torch.clip(self.force(particle_pos,sig=1,eps=1,min_dist=0.1),-max_val,max_val)
-    #     return -torch.clip(lj_force+harm_f,-max_val,max_val)-boundary_f
     
     def force_clipped(self,particle_pos,max_val=80):
         return self.force(particle_pos).clamp(-max_val,max_val)
@@ -129,24 +124,29 @@ class LJ(SimData):
         total_force = torch.sum(force, dim=1)
         com = torch.mean(particle_pos,axis=1)
         rel_pos = particle_pos-com.unsqueeze(1)
-        harm_f = -0.05*(2*rel_pos/self.boxlength)**3
         if not self.periodic:
+            harm_f = -rel_pos * self.harm_coeff
             total_force += harm_f
         # r = torch.linalg.norm(rel_pos,axis=-1)
         # if self.max_r is not None:
         #      boundary_f = (100*(r>self.max_r)*(self.max_r-r)/(r+1e-6)).unsqueeze(-1)*rel_pos
         #      total_force += boundary_f
-        return total_force
+        return 2*total_force
 
+    def grad_log_prob(self,particle_pos):
+        particle_pos.requires_grad_(True)
+        log_prob = self.log_prob(particle_pos)
+        return torch.autograd.grad(log_prob,particle_pos,grad_outputs=torch.ones_like(log_prob))[0]
+    
     def log_prob(self,x):
         return -self.potential(x)
 
     def pair_vec(self,particle_pos):
         pair_vec = (particle_pos.unsqueeze(-2) - particle_pos.unsqueeze(-3))
         if self.periodic:
-            to_subtract = ((torch.abs(pair_vec)> 0.5 * self.boxlength)
-                        * torch.sign(pair_vec) * self.boxlength)
-            pair_vec -= to_subtract
+            #to_subtract = ((torch.abs(pair_vec)> 0.5 * self.boxlength)
+            #            * torch.sign(pair_vec) * self.boxlength)
+            pair_vec = pair_vec - torch.round(pair_vec / self.boxlength) * self.boxlength
         return pair_vec
 
     def g_r(self,particle_pos, bins=100):
@@ -178,3 +178,11 @@ class LJ(SimData):
             areas = 4*math.pi*((bins[:-1]+bins[1:])/2)**2*(bins[1:]-bins[:-1])
             g_r = counts/nsamples/areas/bulk_density
         return bins, g_r
+    
+    def apply_constraints(self,particle_pos):
+        if self.periodic:
+            particle_pos = torch.remainder(particle_pos,self.boxlength)-self.boxlength/2
+            return particle_pos
+        else:
+            com = torch.mean(particle_pos,axis=-2,keepdim=True)
+            return particle_pos-com
