@@ -90,7 +90,7 @@ class BaseModule(LightningModule):
         return {'loss': self.step(batch)}
     
 class DiffusionModel(BaseModule):
-    def __init__(self,score,sde,shape,conditional=False,live=False,likelihood_weighting=False,
+    def __init__(self,score,sde,shape,conditional=False,live=False,likelihood_weighting=False,fp_reg=False,
                  eps = 1e-4, lr: float = 0.001, 
                 weight_decay: float = 0.0005,lattice=None, **kwargs: Any):
         super().__init__()    
@@ -111,7 +111,7 @@ class DiffusionModel(BaseModule):
             if hasattr(self.sde, "sde_list"):
                 self.loss_fn = lambda x,t: loss_fn.piecewise_sde_loss(self.sde,self.score_fn,x,t)
             else:
-                self.loss_fn = lambda x,t: loss_fn.single_sde_loss(self.sde,self.score_fn,x,t)
+                self.loss_fn = lambda x,t: loss_fn.single_sde_loss(self.sde,self.score_fn,x,t,fp_reg=fp_reg)
 
     def configure_callbacks(self):
         resample = Resample()
@@ -151,16 +151,23 @@ class DiffusionModel(BaseModule):
             cell_idx = batch[...,0]
             x = batch[...,1:]
             #randomly select a cell
-            x1, x2 = self.lattice.select_adjacent_cells(x,cell_idx)
+            x1, x2 = self.lattice.select_cell_and_context(x,cell_idx)
             context = x2[0].unsqueeze(0).expand_as(x2)
-            out = self.sample(len(batch),context=context,method="e-m")
-            conditional_sample = torch.cat((context,out["x"]),dim=1)
-            np.save("conditional_sample_traj.npy",conditional_sample.detach().cpu().numpy())
-            write_coord("conditional_sample_traj.xyz",conditional_sample.detach().cpu().numpy(),
-                        nparticles=conditional_sample.shape[1])
-            np.save("simulated_sample_single.npy",batch[0].detach().cpu().numpy())
-            write_coord("simulated_sample_single.xyz",batch[0].detach().cpu().numpy(),
-                        nparticles=batch[0].shape[0])
+            out = self.sample(len(batch),context=context,method="e-m",return_traj=True)
+            traj = out["traj"]
+            np.save("traj.npy",traj.detach().cpu().numpy())
+            write_coord("traj.xyz",traj[0].detach().cpu().numpy())
+            conditional_sample = torch.cat((out["x"],context),dim=1)
+            #apply periodic boundary conditions
+            boxlength = self.lattice.boxlength
+            #conditional_sample = conditional_sample%boxlength - boxlength/2
+            simulated_sample = torch.cat((x1,x2),dim=1)
+            #simulated_sample = simulated_sample%boxlength - boxlength/2 
+            np.save("conditional_sample.npy",conditional_sample.detach().cpu().numpy())
+            write_coord("conditional_sample.xyz",conditional_sample.detach().cpu().numpy())
+            np.save("simulated_sample.npy",simulated_sample.detach().cpu().numpy())
+            write_coord("simulated_sample.xyz",simulated_sample.detach().cpu().numpy())
+            exit()
         else:
             pass
     
@@ -183,7 +190,8 @@ class DiffusionModel(BaseModule):
             start = i*batch_size
             end = min((i+1)*batch_size,nsamples)
             context_batch = context[start:end].to(self.device) if context is not None else None
-            batch_out = self.sde.backward(init[start:end],score_fn=self.score_fn, context=context_batch,
+            with torch.no_grad():
+                batch_out = self.sde.backward(init[start:end],score_fn=self.score_fn, context=context_batch,
                                     t_init=t_init[start:end],method=method,return_traj=return_traj,return_prob=return_prob)
             if i==0:
                 out = batch_out

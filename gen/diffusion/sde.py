@@ -7,8 +7,7 @@ import numpy as np
 from gen.diffusion.sde_utils import SDESolver, NoiseSchedule
 from gen.diffusion.utils import ode_sampler, PDFSampler, neg_force_wrapper
 from gen.diffusion.likelihood import  ODESampler
-
-
+from gen.diffusion.diff import hutch_div, batch_div, exact_trace
 
 class SDE(nn.Module):
     def __init__(self,max_nsteps=500,schedule="linear",beta_max=20,eps=1e-4,
@@ -98,7 +97,19 @@ class SDE(nn.Module):
         prior_logp = self.prior_logp(x_prior)
         logp = prior_logp+lj
         return logp, x_prior, traj
-
+    
+    def dlogp_dt(self,x,t,score_fn):
+        f, g = self.sde(x,t)
+        g_pow = g.reshape(len(x),-1)[:,0]**2
+        score = score_fn(x,t).reshape(len(x),-1)
+        #div_s = batch_div(score_fn, x, t)
+        div_s = exact_trace(score_fn, x,t=t)
+        norm_s = torch.norm(score, dim=-1)
+        f_dot_s = torch.sum(f.reshape(len(x),-1) * score, dim=-1)
+        div_f = 0
+        dlogpdt = 0.5*g_pow*(div_s + norm_s) - f_dot_s - div_f
+        return dlogpdt
+    
     def backward(self,x,score_fn,t_init=None,t_final=None, method="ode",return_prob=False,return_traj=False,**context_args):
         
         if t_init is None:
@@ -136,6 +147,7 @@ class SDE(nn.Module):
                         # output = {"x":x}
         elif method == "e-m":
             t_seq = torch.linspace(t_init[0],t_final[0],self.max_nsteps).to(x.device)
+            print(len(t_seq))
             # context = context_args.get("context",None)
             # if context is not None: #Only implimented euler-maruyama for now
             #     if context_idx is None:
@@ -147,16 +159,23 @@ class SDE(nn.Module):
             #     mean_coeff, sigma = mean_coeff.to(x.device), sigma.to(x.device)
             #     noised_context_traj = self._batch_mult(mean_coeff,context_traj)+self._batch_mult(sigma,std_noise)
             dt = 1/self.max_nsteps
+            if return_traj:
+                traj=[]
             for i,t in enumerate(t_seq):
                 #if context is not None:
                     #x[:,context_idx] = noised_context_traj[i]
                 x = self._apply_constraints(x)
                 drift, diffusion = self.reverse_sde(x, t, score_fn,**context_args)
                 x_mean = x - drift * dt
+                print(drift[0])
                 x = x_mean - diffusion* math.sqrt(dt) * self._apply_constraints(torch.randn_like(x))
             #if context is not None:
                 #x[:,context_idx] = noised_context_traj[i]
+                if return_traj:
+                    traj.append(x.clone())
             output = {"x":x_mean}    
+            if return_traj:
+                output.update({"traj":torch.stack(traj).transpose(0,1)})
         elif method == "sde":
             assert hasattr(self, "reverse_solver")
             x = x.requires_grad_(False)
@@ -192,7 +211,7 @@ class SDE(nn.Module):
         return output
     
 class LinearSDE(SDE):
-    def __init__(self,max_nsteps=1000,schedule="linear",eps=1e-4,**kwargs):
+    def __init__(self,max_nsteps=500,schedule="linear",eps=1e-4,**kwargs):
         super().__init__(max_nsteps,schedule,eps=eps,**kwargs)
     
     def time_importance(self,t):
@@ -227,8 +246,8 @@ class LinearSDE(SDE):
         return std
 
 class ToroidalDiffusion(LinearSDE):
-    def __init__(self,sigma_min=0.01,sigma_max=1,ncells=10,
-                 max_nsteps=1000,eps=1e-4,**kwargs):
+    def __init__(self,sigma_min=1.5e-3,sigma_max=1,ncells=10,
+                 max_nsteps=500,eps=1e-4,**kwargs):
         super().__init__(max_nsteps,eps=eps,**kwargs)
         self.sigma_min = sigma_min*self.periodic_boxlen
         self.sigma_max = sigma_max*self.periodic_boxlen
@@ -265,7 +284,7 @@ class ToroidalDiffusion(LinearSDE):
             def sample(self,nsamples):
                 if isinstance(nsamples,tuple):
                     nsamples = nsamples[0]
-                return self.rsample((nsamples,)+self.shape)
+                return self.rsample((nsamples,)+tuple(self.shape))
 
             def log_prob(self,x):
                 return 1/(self.boxlen**self.dim)*torch.ones(len(x)).to(x.device)
@@ -292,6 +311,7 @@ class ToroidalDiffusion(LinearSDE):
         diffused_x = x + noise
         diffused_x = self._apply_constraints(diffused_x)
         score = self._calc_score(diffused_x-x,sigma)
+        #score_2 = calc_score((diffused_x-x,sigma)/self.periodic_boxlen*math.pi)
         mult_factor = 1000
         mult_noise = torch.randn(mult_factor*x.shape[0],*x.shape[1:]).to(x.device)
         mult_sigma = sigma.repeat(mult_factor)
@@ -311,7 +331,7 @@ class ToroidalDiffusion(LinearSDE):
         return 1/avg_score_norm
 
 class VP_SDE(LinearSDE):
-    def __init__(self,max_nsteps=1000,beta_max=20,eps=1e-4,schedule="linear",**kwargs):
+    def __init__(self,max_nsteps=500,beta_max=20,eps=1e-4,schedule="linear",**kwargs):
         super().__init__(max_nsteps,schedule,eps=eps,beta_max=beta_max,**kwargs)
         self.sde_solver = SDESolver(self.drift,self.diffusion)
 

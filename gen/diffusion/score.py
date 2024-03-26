@@ -63,11 +63,8 @@ class Correction(nn.Module):
                 raise NotImplementedError
             if lattice is not None:
                 score_correction = _batch_mult(self.score_correction_schedule(t,initial_factor=0.2),score)
-                confining_force = lattice.scaled_confining_force(x,t)
-                print(confining_force[0,-1])
-                print(x[0,-1])
-                print("score",score[0,-1])
-                force_correction += confining_force
+                #confining_force = lattice.scaled_confining_force(x,t)
+                #force_correction += confining_force
             else:
                 score_correction = _batch_mult(self.score_correction_schedule(t),score)
             return force_correction+prior_correction+score_correction
@@ -126,8 +123,8 @@ class Score(torch.nn.Module):
         return std
 
     def forward(self,x,t,return_trace=False,context=None,**nn_kwargs):
-        if len(x.shape) == 2:
-            x = x.unsqueeze(0)
+        # if len(x.shape) == 2:
+        #     x = x.unsqueeze(0)
         if len(t.shape) == 0:
             t = t*torch.ones(x.shape[0],device=x.device)
         atomic_numbers = torch.zeros((x.shape[0],x.shape[1]),device=x.device).long()
@@ -142,26 +139,27 @@ class Score(torch.nn.Module):
             # atomic_numbers = torch.zeros((x.shape[0],x.shape[1]),device=x.device).long()
             # atomic_numbers[:,mask] = 1
             x = torch.cat((context,x),dim=1)
-            atomic_numbers[:,context.shape[1]:] = 1
+            atomic_numbers_context = torch.ones((x.shape[0],context.shape[1]),device=x.device).long()
+            atomic_numbers = torch.cat((atomic_numbers_context,atomic_numbers),dim=1)
         if return_trace:
             assert hasattr(self.nn,"trace")
             score, trace = self.nn.trace(x,t)
         else:
-            with torch.enable_grad():
-                score = torch.zeros_like(x).to(x.device)
-                for i, nn in enumerate(self.nn):
-                    t_range = self.t_range_list[i]
-                    m = (t>=t_range[0])&(t<=t_range[1])
+            score = torch.zeros_like(x).to(x.device)
+            for i, nn in enumerate(self.nn):
+                t_range = self.t_range_list[i]
+                m = (t>=t_range[0])&(t<=t_range[1])
+                with torch.no_grad():
                     if torch.any(m):
                         try:
-                            score_i = nn(x[m],t[m],atomic_numbers=atomic_numbers,**nn_kwargs)
+                            score_i = nn(x[m],t[m],atomic_numbers=atomic_numbers)
                         except:
                             score_i = nn(x[m],t[m])
-                        score_i = _batch_mult(1/self.marginal_prob_std(t[m]),score_i)
-                        score[m] = score_i
+                score_i = _batch_mult(1/self.marginal_prob_std(t[m]),score_i)
+                score[m] = score_i
 
-                if self.correction is not None:
-                    score = self.correction(x,t,score,lattice=self.lattice) 
+            if self.correction is not None:
+                score = self.correction(x,t,score,lattice=self.lattice) 
         if context is not None:
             score = score[:,context.shape[1]:]
         if return_trace:

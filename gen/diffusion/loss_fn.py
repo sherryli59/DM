@@ -1,4 +1,5 @@
 import torch
+from gen.diffusion.diff import gradient, t_finite_diff
 
 def sliced_score_matching(score_fn, samples, t, n_eps=1):
     dup_samples = samples.unsqueeze(0).expand(n_eps,
@@ -56,9 +57,28 @@ def loss_from_sde_output(sde_output,score_fn,t):
             loss = sliced_score_matching(score_fn,diffused_x,t, n_eps=5)
     return loss
 
-def single_sde_loss(sde,score_fn,x,t):
+def fp_regularizer(sde,score_fn,x,t,alpha=0.15,beta=0.01,m=2):
+    batch_size = x.shape[0]
+    with torch.enable_grad():
+        x = x.requires_grad_(True)
+        dlogp_dt = sde.dlogp_dt(x,t,score_fn)
+    ds_dt = gradient(dlogp_dt,x)
+    emp_ds_dt = t_finite_diff(score_fn,x,t)
+    _ , g = sde.sde(x,t)
+    weights = g**2
+    weights[t<1e-3] = 0
+    res = torch.linalg.norm((weights*(ds_dt-emp_ds_dt)).reshape(batch_size,-1),dim=1)
+    D = torch.prod(torch.tensor(x.shape[1:]))
+    res = res**m/D**m
+    loss = alpha*torch.mean(res) + beta*torch.mean(torch.abs(dlogp_dt))
+    print("fp loss",torch.mean(res), torch.mean(torch.abs(dlogp_dt)))
+    return loss
+
+def single_sde_loss(sde,score_fn,x,t,fp_reg=False):
     sde_output = sde(x,t)
     loss = loss_from_sde_output(sde_output,score_fn,t)
+    if fp_reg:
+        loss = loss + fp_regularizer(sde,score_fn,x,t)
     return loss
 
 def conditional_loss(sde,score_fn,x,t,lattice):
@@ -66,12 +86,13 @@ def conditional_loss(sde,score_fn,x,t,lattice):
     cell_idx = x[...,0]
     x = x[...,1:]
     #randomly select two adjacent cells
-    x1,x2 = lattice.select_adjacent_cells(x,cell_idx)
+    x1,x2 = lattice.select_sphere_and_context(x,cell_idx)
     sde_output = sde(x1,t)
     diffused_x = sde_output["diffused_x"]
     with torch.enable_grad():
         diffused_x = diffused_x.detach().requires_grad_(True)
         predicted_score = score_fn(diffused_x,t,context=x2,lattice=lattice)
+        #predicted_score = score_fn(diffused_x,t)
     score = sde_output["score"]
     weights = sde_output["weight"]
     score_diff = predicted_score-score.detach()

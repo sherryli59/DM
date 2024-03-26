@@ -7,9 +7,10 @@ class EGNN_dynamics(nn.Module):
     def __init__(
         self,
         n_dimension=3,
-        hidden_nf=64,
+        boxlength=None,
+        hidden_nf=128,
         act_fn=torch.nn.SiLU(),
-        n_layers=4,
+        n_layers=5,
         recurrent=True,
         attention=False,
         condition_time=True,
@@ -19,7 +20,7 @@ class EGNN_dynamics(nn.Module):
     ):
         super().__init__()
         self.egnn = EGNN(
-            in_node_nf=1,
+            in_node_nf=2,
             in_edge_nf=1,
             hidden_nf=hidden_nf,
             act_fn=act_fn,
@@ -31,14 +32,14 @@ class EGNN_dynamics(nn.Module):
         )
 
         self._n_dimension = n_dimension
+        self.boxlength = boxlength
         self.edges = None
         self._edges_dict = {}
         self.condition_time = condition_time
         # Count function calls
         self.counter = 0
 
-    def forward(self, xs, t):
-        t = t.unsqueeze(-1)
+    def forward(self, xs, t, atomic_numbers=None):
         n_batch = xs.shape[0]
         n_particles = xs.shape[1]
         if self.edges is None:
@@ -46,17 +47,24 @@ class EGNN_dynamics(nn.Module):
         edges = self._cast_edges2batch(self.edges, n_batch, n_particles)
         edges = [edges[0].to(xs.device), edges[1].to(xs.device)]
         x = xs.reshape(n_batch * n_particles, self._n_dimension).clone()
-        h = torch.ones(n_batch, n_particles).to(xs.device)
-
+        if atomic_numbers is None:
+            h = torch.ones(n_batch, n_particles).to(xs.device)
+        else:
+            h = atomic_numbers.to(xs.device)
+        t = t.unsqueeze(-1).expand(n_batch, n_particles)
         if self.condition_time:
-            h = h * t
-        h = h.reshape(n_batch * n_particles, 1)
-        edge_attr = torch.sum((x[edges[0]] - x[edges[1]]) ** 2, dim=1, keepdim=True)
+            h = torch.cat([h,t],dim=1)
+        h = h.reshape(n_batch * n_particles, 2)
+        edge_vec = x[edges[0]] - x[edges[1]]
+        #apply periodic boundary conditions
+        if self.boxlength is not None:
+            edge_vec = edge_vec - torch.round(edge_vec / self.boxlength) * self.boxlength
+        edge_attr = torch.sum(edge_vec ** 2, dim=1, keepdim=True)
         _, x_final = self.egnn(h, x, edges, edge_attr=edge_attr)
         vel = x_final - x
 
         vel = vel.view(n_batch, n_particles, self._n_dimension)
-        vel = vel - torch.mean(vel, dim=1, keepdim=True)
+        #vel = vel - torch.mean(vel, dim=1, keepdim=True)
         self.counter += 1
         return vel.view(n_batch, n_particles, self._n_dimension)
 

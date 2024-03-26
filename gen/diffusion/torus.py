@@ -75,3 +75,7 @@ def score_norm(sigma):
     sigma = (sigma - np.log(SIGMA_MIN)) / (np.log(SIGMA_MAX) - np.log(SIGMA_MIN)) * SIGMA_N
     sigma = np.round(np.clip(sigma, 0, SIGMA_N)).astype(int)
     return score_norm_[sigma]
+
+print(x)
+print(score(x, sigma))
+print(score_norm(sigma))

@@ -176,10 +176,60 @@ class Lattice():
         x1 = x1-displacement_vec.unsqueeze(1)
         x2 = x2-displacement_vec.unsqueeze(1)
         boxlength = self.boxlength
-        x2 = x2%boxlength
-        x2 = x2-((torch.abs(x2)> 0.5 * boxlength)
-                * torch.sign(x2) * boxlength)
         return x1,x2
+
+    def select_sphere_and_context(self,x,cell_idx):
+        #randomly select a particle
+        nparticles = x.shape[0]
+        particle = torch.randint(nparticles,(1,)).to(cell_idx.device)
+        #compute the distance to all other particles
+        displacement = x - x[particle]
+        #apply periodic boundary conditions
+        displacement -= ((torch.abs(displacement)> 0.5 * self.boxlength)
+                        * torch.sign(displacement) * self.boxlength)
+        distance = torch.norm(displacement,dim=-1)
+        #only select the top 19 of the context based on distance
+        _, idx = torch.topk(distance,20,dim=1,  largest=False)
+        mask = torch.zeros_like(distance).bool()
+        mask.scatter_(1,idx,True)
+        mask = mask.unsqueeze(-1).expand(x.shape)
+        core = x[mask].reshape(x.shape[0],-1,x.shape[-1])
+        # select the next 100 particles as the context
+        _, idx_context = torch.topk(distance,120,dim=1,largest=False)
+        mask = torch.zeros_like(distance).bool()
+        mask.scatter_(1,idx_context,True)
+        mask.scatter_(1,idx,False)
+        mask = mask.unsqueeze(-1).expand(x.shape)
+        context = x[mask].reshape(x.shape[0],-1,x.shape[-1])
+        return core,context
+
+
+
+
+    def select_cell_and_context(self,x,cell_idx):
+        cell = torch.randint(int(cell_idx.max().item()),(1,)).to(cell_idx.device)
+        mask = (cell_idx==cell).unsqueeze(-1).expand(x.shape)
+        x1 = x[mask].reshape(x.shape[0],-1,x.shape[-1])
+        context = x[~mask].reshape(x.shape[0],-1,x.shape[-1])
+        #move x1 to the origin
+        displacement_vec = self.lattice[cell]
+        x1 = x1-displacement_vec.unsqueeze(1)
+        context = context-displacement_vec.unsqueeze(1)
+        #apply periodic boundary conditions
+        to_subtract = ((torch.abs(context)> 0.5 * self.boxlength)
+                        * torch.sign(context) * self.boxlength)
+        context -= to_subtract
+        #apply cutoff
+        distance = torch.linalg.norm(context,dim=-1)
+        #only select the top 20% of the context based on distance
+        _, idx = torch.topk(distance,int(0.2*distance.shape[1]),dim=1,  largest=False)
+        #convert idx to mask
+        mask = torch.zeros_like(distance).bool()
+        mask.scatter_(1,idx,True)
+        mask = mask.unsqueeze(-1).expand(context.shape)
+        context = context[mask].reshape(x.shape[0],-1,x.shape[-1])
+        return x1, context
+
 
 if __name__=="__main__":
     import matplotlib.pyplot as plt

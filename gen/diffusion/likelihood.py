@@ -1,14 +1,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from scipy import integrate
 from torchdiffeq import odeint as odeint
-try:
-    from functorch import vmap
-except ModuleNotFoundError:
-    pass
-from gen.diffusion import utils
-from gen.diffusion.hessian_trace import hutch_trace, exact_trace
+from gen.diffusion.diff import hutch_trace, exact_trace
 
 
 
